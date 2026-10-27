@@ -92,7 +92,44 @@ function nextAction({ t, pr, ns, onGh }) {
   );
 }
 
-function NextCard({ t, pr, d, def, ns, now, onGh }) {
+function RefreshButton({ t, onRefresh, primary }) {
+  const [busy, setBusy] = React.useState(false);
+  const run = () => {
+    if (busy) return;
+    setBusy(true);
+    Promise.resolve()
+      .then(() => onRefresh())
+      .finally(() => setBusy(false));
+  };
+  if (!primary) {
+    return h(
+      "button",
+      {
+        type: "button",
+        className: "ght-icon-btn ght-bare",
+        title: busy ? t("正在刷新…", "Refreshing…") : t("从 GitHub 重新读取", "Reload from GitHub"),
+        "aria-label": t("刷新状态", "Refresh status"),
+        onClick: run,
+        disabled: busy,
+      },
+      h(Icon, { name: "refresh", size: 14 }),
+    );
+  }
+  return h(
+    "button",
+    {
+      type: "button",
+      className: "ght-btn",
+      title: t("刚在 GitHub 合并了？按编号重新读取状态", "Merged on GitHub? Re-read the state"),
+      onClick: run,
+      disabled: busy,
+    },
+    h(Icon, { name: "refresh", size: 13 }),
+    busy ? t("刷新中…", "Refreshing…") : t("刷新状态", "Refresh status"),
+  );
+}
+
+function NextCard({ t, pr, d, def, ns, now, onGh, onRefresh }) {
   return h(
     "div",
     { className: `ght-next ght-next-${ns.owner}` },
@@ -104,7 +141,12 @@ function NextCard({ t, pr, d, def, ns, now, onGh }) {
       h("b", null, t(`为什么是「${def.label}」：`, `Why "${def.label}": `)),
       ns.why,
     ),
-    h("div", { className: "ght-next-acts" }, nextAction({ t, pr, ns, onGh })),
+    h(
+      "div",
+      { className: "ght-next-acts" },
+      nextAction({ t, pr, ns, onGh }),
+      ns.owner === "merge" ? h(RefreshButton, { t, onRefresh, primary: true }) : null,
+    ),
   );
 }
 
@@ -261,7 +303,7 @@ function MarksSection({ t, store, pr, terminal, done, ignored, toast }) {
   );
 }
 
-function DrawerHeader({ t, pr, d, def, ignored, onGh, onClose }) {
+function DrawerHeader({ t, pr, d, def, ignored, onGh, onClose, onRefresh }) {
   return h(
     "div",
     { className: "ght-dr-head" },
@@ -274,6 +316,7 @@ function DrawerHeader({ t, pr, d, def, ignored, onGh, onClose }) {
       d.reviews ? h(Tag, null, t(`已审 ${d.reviews} 次`, `Reviewed ${d.reviews}×`)) : null,
       ignored ? h(Tag, null, t("已忽略", "Ignored")) : null,
       h("span", { className: "ght-sp" }),
+      h(RefreshButton, { t, onRefresh }),
       h("button", { type: "button", className: "ght-icon-btn ght-bare", title: t("在 GitHub 打开", "Open on GitHub"), onClick: () => onGh(prUrl(pr)) }, h(Icon, { name: "ext", size: 14 })),
       h("button", { type: "button", className: "ght-icon-btn ght-bare", title: t("关闭（Esc）", "Close (Esc)"), onClick: onClose }, h(Icon, { name: "x", size: 15 })),
     ),
@@ -291,7 +334,7 @@ function DrawerHeader({ t, pr, d, def, ignored, onGh, onClose }) {
   );
 }
 
-export function Drawer({ t, ctx, store, pr, rules, defs, now, wts, prs, bindings, index, toast, onClose, onGh, onBind, onWorktree }) {
+export function Drawer({ t, ctx, store, pr, rules, defs, now, wts, prs, bindings, index, toast, onClose, onGh, onRefresh, onBind, onWorktree }) {
   const d = derive(pr, rules);
   const wt0 = wtFor(pr, { wts, prs, bindings, rules });
   const dView = reviewingState(d, !!wt0, store.getSnapshot().local.reviewing[pr.key]);
@@ -304,11 +347,11 @@ export function Drawer({ t, ctx, store, pr, rules, defs, now, wts, prs, bindings
     h(
       "aside",
       { key: "drawer", className: "ght-drawer", "aria-label": t("PR 详情", "PR details") },
-      h(DrawerHeader, { t, pr, d, def, ignored: pr.ignored, onGh, onClose }),
+      h(DrawerHeader, { t, pr, d, def, ignored: pr.ignored, onGh, onClose, onRefresh }),
       h(
         "div",
         { className: "ght-dr-body" },
-        h(NextCard, { t, pr, d: dView, def, ns, now, onGh }),
+        h(NextCard, { t, pr, d: dView, def, ns, now, onGh, onRefresh }),
         h(WorktreeSection, { t, ctx, store, index, pr, wt, bindings, terminal, toast, onBind, onWorktree }),
         h(
           "div",

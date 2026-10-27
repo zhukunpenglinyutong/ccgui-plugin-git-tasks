@@ -60,6 +60,38 @@ export function listArgs(slug, after) {
   return args;
 }
 
+/** 单个 PR 的当前状态 + 列表字段（按编号直查，不走搜索索引）。
+ *
+ * `gh pr list --search` 依赖 GitHub 搜索索引，刚合并的 PR 可能几分钟内查不到；
+ * 抽屉里的「刷新状态」和 open 列表消失的公关核对都用这条查询，绕开索引延迟。
+ * 编号直接内联进查询文本：gh 的 `-f` 只发字符串，`-F`（原始值）被只读白名单拒绝。
+ */
+const PR_BY_NUMBER_JQ =
+  '.data.repository.pullRequest | if . == null then [] else [[.number,.title,.url,.isDraft,.createdAt,.updatedAt,.additions,.deletions,.author.login,.headRefName,.headRefOid,.baseRefName,.isCrossRepository,.state,.mergedAt,.closedAt]] end';
+
+export function prByNumberArgs(slug, number) {
+  const { owner, name } = splitSlug(slug);
+  const n = Number(number);
+  if (!Number.isInteger(n) || n <= 0) throw new Error(`无效的 PR 编号：${number}`);
+  const query = `query($owner:String!,$name:String!){repository(owner:$owner,name:$name){pullRequest(number: ${n}){
+    number title url isDraft createdAt updatedAt additions deletions
+    author{login} headRefName headRefOid baseRefName isCrossRepository
+    state mergedAt closedAt
+  }}}`;
+  return [
+    "api",
+    "graphql",
+    "-f",
+    `query=${query}`,
+    "-f",
+    `owner=${owner}`,
+    "-f",
+    `name=${name}`,
+    "--jq",
+    PR_BY_NUMBER_JQ,
+  ];
+}
+
 /** 一批 PR 的详情（别名 p0…pN，控制单次输出体积）。 */
 export function detailQuery(numbers) {
   const aliases = numbers

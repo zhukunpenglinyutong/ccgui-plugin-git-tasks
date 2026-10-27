@@ -158,6 +158,25 @@ function usePanelActions({ store, exec, sync, showToast, t }) {
         if (result?.errors?.[slug]) showToast(result.errors[slug]);
         else showToast(t(`${slug} 已恢复`, `${slug} recovered`));
       },
+      refreshPr: async (pr) => {
+        if (!sync.refreshPr) return;
+        try {
+          const updated = await sync.refreshPr(pr.key);
+          if (!updated) {
+            showToast(t("这个 PR 不在当前同步结果里，请先整体同步", "PR is not in the current snapshot; sync first"));
+            return;
+          }
+          const label =
+            updated.state === "MERGED"
+              ? t("已合并", "merged")
+              : updated.state === "CLOSED"
+                ? t("已关闭", "closed")
+                : t("仍在进行中", "still open");
+          showToast(t(`已刷新 #${updated.number}：${label}`, `#${updated.number} refreshed: ${label}`));
+        } catch (error) {
+          showToast(describeGhError(error));
+        }
+      },
       syncNow: async () => {
         await sync.run();
         const snapshot = store.getSnapshot();
@@ -361,6 +380,7 @@ function DrawerLayer({ t, ctx, store, index, state, now, prs, workspaces, select
     toast: showToast,
     onClose: () => store.setUi({ drawerKey: null }),
     onGh: actions.ghOpen,
+    onRefresh: () => actions.refreshPr(selectedPr),
     onBind: actions.openBind,
     onWorktree: actions.onWorktree,
   });

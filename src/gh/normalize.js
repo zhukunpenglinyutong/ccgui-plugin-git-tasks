@@ -183,6 +183,24 @@ export function normalizeEndedRow(row, { owner, repo }) {
   };
 }
 
+/** `prByNumberArgs` 的紧凑行 → `normalizeEndedRow` 的输入（已结束分支）。 */
+export function endedRowFromStateRow(row) {
+  const [number, title, url, isDraft, createdAt, updatedAt, , , author, headRefName, , baseRefName, , , mergedAt, closedAt] = row;
+  return {
+    number,
+    title,
+    url,
+    createdAt,
+    updatedAt,
+    isDraft,
+    author: { login: author || "" },
+    headRefName,
+    baseRefName,
+    mergedAt: mergedAt || null,
+    closedAt: closedAt || null,
+  };
+}
+
 /** `gh pr list --jq` 的紧凑行 → 对象（已结束）。 */
 export function endedRowFromArray(row) {
   const [number, title, url, createdAt, updatedAt, isDraft, author, headRefName, baseRefName, mergedAt, closedAt] = row;

@@ -1815,6 +1815,22 @@ function normalizeEndedRow(row, { owner, repo }) {
     state: mergedAt ? "MERGED" : "CLOSED"
   };
 }
+function endedRowFromStateRow(row) {
+  const [number, title, url, isDraft, createdAt, updatedAt, , , author, headRefName, , baseRefName, , , mergedAt, closedAt] = row;
+  return {
+    number,
+    title,
+    url,
+    createdAt,
+    updatedAt,
+    isDraft,
+    author: { login: author || "" },
+    headRefName,
+    baseRefName,
+    mergedAt: mergedAt || null,
+    closedAt: closedAt || null
+  };
+}
 function endedRowFromArray(row) {
   const [number, title, url, createdAt, updatedAt, isDraft, author, headRefName, baseRefName, mergedAt, closedAt] = row;
   return {
@@ -1894,6 +1910,29 @@ function listArgs(slug, after) {
   if (after) args.push("-f", `after=${after}`);
   args.push("--jq", LIST_JQ);
   return args;
+}
+var PR_BY_NUMBER_JQ = ".data.repository.pullRequest | if . == null then [] else [[.number,.title,.url,.isDraft,.createdAt,.updatedAt,.additions,.deletions,.author.login,.headRefName,.headRefOid,.baseRefName,.isCrossRepository,.state,.mergedAt,.closedAt]] end";
+function prByNumberArgs(slug, number) {
+  const { owner, name } = splitSlug(slug);
+  const n = Number(number);
+  if (!Number.isInteger(n) || n <= 0) throw new Error(`\u65E0\u6548\u7684 PR \u7F16\u53F7\uFF1A${number}`);
+  const query = `query($owner:String!,$name:String!){repository(owner:$owner,name:$name){pullRequest(number: ${n}){
+    number title url isDraft createdAt updatedAt additions deletions
+    author{login} headRefName headRefOid baseRefName isCrossRepository
+    state mergedAt closedAt
+  }}}`;
+  return [
+    "api",
+    "graphql",
+    "-f",
+    `query=${query}`,
+    "-f",
+    `owner=${owner}`,
+    "-f",
+    `name=${name}`,
+    "--jq",
+    PR_BY_NUMBER_JQ
+  ];
 }
 function detailQuery(numbers) {
   const aliases = numbers.map((n, i) => `p${i}: pullRequest(number: ${Number(n)}){${DETAIL_NODE}}`).join("\n");
@@ -2095,27 +2134,67 @@ async function fetchEnded(slug, { exec, rules, nowMs, openKeys, prev }) {
   }
   return out;
 }
+function terminalAt(pr) {
+  const terminal = (pr.events || []).find((e) => e.type === "merged" || e.type === "closed");
+  return terminal?.at || 0;
+}
+function mergeByKey(lists) {
+  const map = /* @__PURE__ */ new Map();
+  for (const list of lists) for (const pr of list) map.set(pr.key, pr);
+  return [...map.values()];
+}
+async function fetchPrByNumber(slug, number, { exec, meSet = /* @__PURE__ */ new Set() }) {
+  const result = await exec.runGh(prByNumberArgs(slug, number));
+  const rows = parseRows(result.stdout);
+  const row = Array.isArray(rows) ? rows[0] : null;
+  if (!row) return null;
+  const [owner, repo] = slug.split("/");
+  const state = row[13];
+  if (state === "MERGED" || state === "CLOSED") {
+    return normalizeEndedRow(endedRowFromStateRow(row), { owner, repo });
+  }
+  if (state !== "OPEN") return null;
+  const pr = parseListRow(row.slice(0, 13), { owner, repo });
+  const details = await loadDetails(slug, [pr.number], exec, meSet);
+  const detail = details.get(pr.number);
+  return detail ? mergeDetail(pr, detail, { meSet }) : ensureOpened(pr);
+}
 var AUX_TTL_MS = 30 * 6e4;
 async function fetchRepo(slug, { exec, prev, rules, nowMs, meSet = /* @__PURE__ */ new Set() }) {
   const open = await fetchOpenPrs(slug, { exec, prev, rules, meSet });
+  const openKeys = new Set(open.map((pr) => pr.key));
+  const vanishedPrev = (prev?.prs || []).filter((pr) => pr.state === "OPEN" && !openKeys.has(pr.key));
+  const resolved = await mapLimit(vanishedPrev, 2, async (pr) => {
+    try {
+      return await fetchPrByNumber(slug, pr.number, { exec, meSet }) || pr;
+    } catch {
+      return pr;
+    }
+  });
+  const stillOpen = resolved.filter((pr) => pr.state === "OPEN");
+  const resolvedEnded = resolved.filter((pr) => pr.state !== "OPEN");
+  const since = sinceDate(nowMs, Math.max(1, Number(rules.endedDays) || 7));
+  const sinceMs = Date.parse(`${since}T00:00:00Z`);
+  const carry = (prev?.prs || []).filter(
+    (pr) => pr.state !== "OPEN" && !openKeys.has(pr.key) && terminalAt(pr) >= sinceMs
+  );
   const needsAux = !prev?.auxAt || nowMs - prev.auxAt >= AUX_TTL_MS;
   if (!needsAux) {
     return {
       ...prev,
       syncedAt: nowMs,
-      prs: [...open, ...(prev.prs || []).filter((pr) => pr.state !== "OPEN")],
+      prs: mergeByKey([carry, resolvedEnded, stillOpen, open]),
       daily: prev.daily || {},
       auxAt: prev.auxAt
     };
   }
-  const openKeys = new Set(open.map((pr) => pr.key));
   const ended = await fetchEnded(slug, { exec, rules, nowMs, openKeys, prev });
   const createdRows = parseRows((await exec.runGh(createdArgs(slug, sinceDate(nowMs, 14)))).stdout);
   const daily = createdRows ? dailyCounts(createdRows.map(createdRowFromArray), rules.dayCutoff) : prev?.daily || {};
   return {
     syncedAt: nowMs,
     auxAt: nowMs,
-    prs: [...open, ...ended],
+    prs: mergeByKey([carry, resolvedEnded, ended, stillOpen, open]),
     daily
   };
 }
@@ -2191,7 +2270,35 @@ function createSync({ exec, store, now = Date.now, viewer = fetchViewerLogin, on
     });
     return running;
   }
-  return { run };
+  const meSetOf = (state) => new Set(
+    [state.runtime.ghLogin, ...state.cfg.extraAccounts].filter(Boolean).map((v) => String(v).toLowerCase())
+  );
+  function findSnapshotPr(prKey) {
+    for (const [slug, snap] of Object.entries(store.getSnapshot().snapshots)) {
+      const pr = snap.prs.find((p) => p.key === prKey);
+      if (pr) return { slug, pr };
+    }
+    return null;
+  }
+  async function refreshPr(prKey) {
+    if (running) await running.catch(() => void 0);
+    const hit = findSnapshotPr(prKey);
+    if (!hit) return null;
+    const updated = await fetchPrByNumber(hit.slug, hit.pr.number, {
+      exec,
+      meSet: meSetOf(store.getSnapshot())
+    });
+    if (!updated) return null;
+    const snap = store.getSnapshot().snapshots[hit.slug];
+    if (!snap) return null;
+    store.setSnapshot(hit.slug, {
+      ...snap,
+      prs: mergeByKey([snap.prs.filter((pr) => pr.key !== prKey), [updated]])
+    });
+    if (onAfter) onAfter();
+    return updated;
+  }
+  return { run, refreshPr };
 }
 function createSchedulerApi(box, { run, now, isForeground, setTimer, clearTimer }) {
   const clear = () => {
@@ -3205,7 +3312,41 @@ function nextAction({ t, pr, ns, onGh }) {
     t("\u5728 GitHub \u6253\u5F00", "Open on GitHub")
   );
 }
-function NextCard({ t, pr, d, def, ns, now, onGh }) {
+function RefreshButton({ t, onRefresh, primary }) {
+  const [busy, setBusy] = React.useState(false);
+  const run = () => {
+    if (busy) return;
+    setBusy(true);
+    Promise.resolve().then(() => onRefresh()).finally(() => setBusy(false));
+  };
+  if (!primary) {
+    return h(
+      "button",
+      {
+        type: "button",
+        className: "ght-icon-btn ght-bare",
+        title: busy ? t("\u6B63\u5728\u5237\u65B0\u2026", "Refreshing\u2026") : t("\u4ECE GitHub \u91CD\u65B0\u8BFB\u53D6", "Reload from GitHub"),
+        "aria-label": t("\u5237\u65B0\u72B6\u6001", "Refresh status"),
+        onClick: run,
+        disabled: busy
+      },
+      h(Icon, { name: "refresh", size: 14 })
+    );
+  }
+  return h(
+    "button",
+    {
+      type: "button",
+      className: "ght-btn",
+      title: t("\u521A\u5728 GitHub \u5408\u5E76\u4E86\uFF1F\u6309\u7F16\u53F7\u91CD\u65B0\u8BFB\u53D6\u72B6\u6001", "Merged on GitHub? Re-read the state"),
+      onClick: run,
+      disabled: busy
+    },
+    h(Icon, { name: "refresh", size: 13 }),
+    busy ? t("\u5237\u65B0\u4E2D\u2026", "Refreshing\u2026") : t("\u5237\u65B0\u72B6\u6001", "Refresh status")
+  );
+}
+function NextCard({ t, pr, d, def, ns, now, onGh, onRefresh }) {
   return h(
     "div",
     { className: `ght-next ght-next-${ns.owner}` },
@@ -3217,7 +3358,12 @@ function NextCard({ t, pr, d, def, ns, now, onGh }) {
       h("b", null, t(`\u4E3A\u4EC0\u4E48\u662F\u300C${def.label}\u300D\uFF1A`, `Why "${def.label}": `)),
       ns.why
     ),
-    h("div", { className: "ght-next-acts" }, nextAction({ t, pr, ns, onGh }))
+    h(
+      "div",
+      { className: "ght-next-acts" },
+      nextAction({ t, pr, ns, onGh }),
+      ns.owner === "merge" ? h(RefreshButton, { t, onRefresh, primary: true }) : null
+    )
   );
 }
 function useRemoveWorktree({ ctx, store, index, pr, wt, toast, t }) {
@@ -3352,7 +3498,7 @@ function MarksSection({ t, store, pr, terminal, done, ignored, toast }) {
     )
   );
 }
-function DrawerHeader({ t, pr, d, def, ignored, onGh, onClose }) {
+function DrawerHeader({ t, pr, d, def, ignored, onGh, onClose, onRefresh }) {
   return h(
     "div",
     { className: "ght-dr-head" },
@@ -3365,6 +3511,7 @@ function DrawerHeader({ t, pr, d, def, ignored, onGh, onClose }) {
       d.reviews ? h(Tag, null, t(`\u5DF2\u5BA1 ${d.reviews} \u6B21`, `Reviewed ${d.reviews}\xD7`)) : null,
       ignored ? h(Tag, null, t("\u5DF2\u5FFD\u7565", "Ignored")) : null,
       h("span", { className: "ght-sp" }),
+      h(RefreshButton, { t, onRefresh }),
       h("button", { type: "button", className: "ght-icon-btn ght-bare", title: t("\u5728 GitHub \u6253\u5F00", "Open on GitHub"), onClick: () => onGh(prUrl(pr)) }, h(Icon, { name: "ext", size: 14 })),
       h("button", { type: "button", className: "ght-icon-btn ght-bare", title: t("\u5173\u95ED\uFF08Esc\uFF09", "Close (Esc)"), onClick: onClose }, h(Icon, { name: "x", size: 15 }))
     ),
@@ -3381,7 +3528,7 @@ function DrawerHeader({ t, pr, d, def, ignored, onGh, onClose }) {
     )
   );
 }
-function Drawer({ t, ctx, store, pr, rules, defs, now, wts, prs, bindings, index, toast, onClose, onGh, onBind, onWorktree }) {
+function Drawer({ t, ctx, store, pr, rules, defs, now, wts, prs, bindings, index, toast, onClose, onGh, onRefresh, onBind, onWorktree }) {
   const d = derive(pr, rules);
   const wt0 = wtFor(pr, { wts, prs, bindings, rules });
   const dView = reviewingState(d, !!wt0, store.getSnapshot().local.reviewing[pr.key]);
@@ -3394,11 +3541,11 @@ function Drawer({ t, ctx, store, pr, rules, defs, now, wts, prs, bindings, index
     h(
       "aside",
       { key: "drawer", className: "ght-drawer", "aria-label": t("PR \u8BE6\u60C5", "PR details") },
-      h(DrawerHeader, { t, pr, d, def, ignored: pr.ignored, onGh, onClose }),
+      h(DrawerHeader, { t, pr, d, def, ignored: pr.ignored, onGh, onClose, onRefresh }),
       h(
         "div",
         { className: "ght-dr-body" },
-        h(NextCard, { t, pr, d: dView, def, ns, now, onGh }),
+        h(NextCard, { t, pr, d: dView, def, ns, now, onGh, onRefresh }),
         h(WorktreeSection, { t, ctx, store, index, pr, wt, bindings, terminal, toast, onBind, onWorktree }),
         h(
           "div",
@@ -4386,6 +4533,20 @@ function usePanelActions({ store, exec, sync, showToast, t }) {
         if (result?.errors?.[slug]) showToast(result.errors[slug]);
         else showToast(t(`${slug} \u5DF2\u6062\u590D`, `${slug} recovered`));
       },
+      refreshPr: async (pr) => {
+        if (!sync.refreshPr) return;
+        try {
+          const updated = await sync.refreshPr(pr.key);
+          if (!updated) {
+            showToast(t("\u8FD9\u4E2A PR \u4E0D\u5728\u5F53\u524D\u540C\u6B65\u7ED3\u679C\u91CC\uFF0C\u8BF7\u5148\u6574\u4F53\u540C\u6B65", "PR is not in the current snapshot; sync first"));
+            return;
+          }
+          const label = updated.state === "MERGED" ? t("\u5DF2\u5408\u5E76", "merged") : updated.state === "CLOSED" ? t("\u5DF2\u5173\u95ED", "closed") : t("\u4ECD\u5728\u8FDB\u884C\u4E2D", "still open");
+          showToast(t(`\u5DF2\u5237\u65B0 #${updated.number}\uFF1A${label}`, `#${updated.number} refreshed: ${label}`));
+        } catch (error) {
+          showToast(describeGhError(error));
+        }
+      },
       syncNow: async () => {
         await sync.run();
         const snapshot = store.getSnapshot();
@@ -4565,6 +4726,7 @@ function DrawerLayer({ t, ctx, store, index, state, now, prs, workspaces, select
     toast: showToast,
     onClose: () => store.setUi({ drawerKey: null }),
     onGh: actions.ghOpen,
+    onRefresh: () => actions.refreshPr(selectedPr),
     onBind: actions.openBind,
     onWorktree: actions.onWorktree
   });

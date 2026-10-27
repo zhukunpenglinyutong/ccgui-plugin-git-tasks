@@ -127,10 +127,15 @@ async function mount() {
   store.setSnapshot("zhukunpenglinyutong/desktop-cc-gui", snap);
   store.setRuntime({ ghLogin: "zhukunpenglinyutong", lastSync: Date.now() });
   const syncCalls = [];
+  const refreshCalls = [];
   const sync = {
     run: async (repos) => {
       syncCalls.push(repos);
       return { errors: {}, login: "zhukunpenglinyutong" };
+    },
+    refreshPr: async (key) => {
+      refreshCalls.push(key);
+      return { number: Number(String(key).split("#")[1]), state: "MERGED" };
     },
   };
   const Panel = createPanel({
@@ -147,7 +152,7 @@ async function mount() {
   await act(async () => {
     root.render(React.createElement(Panel));
   });
-  return { root, container, store, index, exec, ctx, syncCalls };
+  return { root, container, store, index, exec, ctx, syncCalls, refreshCalls };
 }
 
 test("面板：KPI、看板、空态文案真实渲染", async () => {
@@ -191,6 +196,22 @@ test("卡片打开详情抽屉，Esc 关闭", async () => {
     document.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "Escape" }));
   });
   assert.equal(container.querySelector(".ght-drawer"), null);
+  await act(async () => root.unmount());
+});
+
+test("抽屉：刷新状态按钮按 PR 重新读取并提示结果", async () => {
+  const { root, container, refreshCalls } = await mount();
+  await act(async () => container.querySelector(".ght-kc").click());
+  const btn = [...container.querySelectorAll(".ght-drawer .ght-dr-head button")].find((b) =>
+    (b.getAttribute("title") || "").includes("从 GitHub 重新读取"),
+  );
+  assert.ok(btn, "抽屉头部有刷新按钮");
+  await act(async () => {
+    btn.click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+  assert.equal(refreshCalls.length, 1);
+  assert.match(container.textContent, /已刷新 #\d+：已合并/);
   await act(async () => root.unmount());
 });
 

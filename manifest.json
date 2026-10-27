@@ -1,7 +1,7 @@
 {
   "id": "github-tasks",
   "name": "CCGUI · Git 任务管理",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "sdkVersion": ">=0.3.22",
   "minAppVersion": "1.1.8",
   "tier": "js",

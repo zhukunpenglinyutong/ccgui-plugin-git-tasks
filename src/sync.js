@@ -11,6 +11,7 @@ import {
   createdRowFromArray,
   dailyCounts,
   endedRowFromArray,
+  endedRowFromStateRow,
   mergeDetail,
   normalizeEndedRow,
   parseListRow,
@@ -22,6 +23,7 @@ import {
   detailArgs,
   listArgs,
   mergedArgs,
+  prByNumberArgs,
 } from "./gh/queries.js";
 
 const MAX_PAGES = Math.ceil(MAX_OPEN_PRS / 50);
@@ -169,23 +171,76 @@ async function fetchEnded(slug, { exec, rules, nowMs, openKeys, prev }) {
   return out;
 }
 
+function terminalAt(pr) {
+  const terminal = (pr.events || []).find((e) => e.type === "merged" || e.type === "closed");
+  return terminal?.at || 0;
+}
+
+/** 按 key 合并多份 PR 列表：后出现的覆盖先出现的（新数据优先）。 */
+function mergeByKey(lists) {
+  const map = new Map();
+  for (const list of lists) for (const pr of list) map.set(pr.key, pr);
+  return [...map.values()];
+}
+
+/** 一个 PR 的真实状态（按编号直查，绕过已结束列表的搜索索引延迟）。
+ *  返回归一化后的 PR；查不到（删号 / 无权限）返回 null。 */
+export async function fetchPrByNumber(slug, number, { exec, meSet = new Set() }) {
+  const result = await exec.runGh(prByNumberArgs(slug, number));
+  const rows = parseRows(result.stdout);
+  const row = Array.isArray(rows) ? rows[0] : null;
+  if (!row) return null;
+  const [owner, repo] = slug.split("/");
+  const state = row[13];
+  if (state === "MERGED" || state === "CLOSED") {
+    return normalizeEndedRow(endedRowFromStateRow(row), { owner, repo });
+  }
+  if (state !== "OPEN") return null;
+  const pr = parseListRow(row.slice(0, 13), { owner, repo });
+  const details = await loadDetails(slug, [pr.number], exec, meSet);
+  const detail = details.get(pr.number);
+  return detail ? mergeDetail(pr, detail, { meSet }) : ensureOpened(pr);
+}
+
 /** 拉一个仓库的快照。`prev` 是上一份快照，用于增量与失败兜底。 */
 const AUX_TTL_MS = 30 * 60_000;
 
 export async function fetchRepo(slug, { exec, prev, rules, nowMs, meSet = new Set() }) {
   const open = await fetchOpenPrs(slug, { exec, prev, rules, meSet });
+  const openKeys = new Set(open.map((pr) => pr.key));
+  // 上一轮还在、这一轮消失的 PR：多半刚合并 / 关闭（搜索索引有延迟），
+  // 也可能被列表上限挤出。按编号核对真实状态，别让它停在旧状态或凭空消失。
+  const vanishedPrev = (prev?.prs || []).filter((pr) => pr.state === "OPEN" && !openKeys.has(pr.key));
+  const resolved = await mapLimit(vanishedPrev, 2, async (pr) => {
+    try {
+      return (await fetchPrByNumber(slug, pr.number, { exec, meSet })) || pr;
+    } catch {
+      return pr;
+    }
+  });
+  const stillOpen = resolved.filter((pr) => pr.state === "OPEN");
+  const resolvedEnded = resolved.filter((pr) => pr.state !== "OPEN");
+  // 已结束列表按 endedDays 取窗；窗口内上一轮的结果沿用，避免搜索索引延迟时
+  // 刚合并的 PR 被丢掉，窗口外的旧数据仍然按时淘汰。
+  const since = sinceDate(nowMs, Math.max(1, Number(rules.endedDays) || 7));
+  const sinceMs = Date.parse(`${since}T00:00:00Z`);
+  const carry = (prev?.prs || []).filter(
+    (pr) =>
+      pr.state !== "OPEN" &&
+      !openKeys.has(pr.key) &&
+      terminalAt(pr) >= sinceMs,
+  );
   // 已结束列表与每日统计变化慢：30 分钟内复用上一轮，避免每 15 分钟都多打 3 次 gh。
   const needsAux = !prev?.auxAt || nowMs - prev.auxAt >= AUX_TTL_MS;
   if (!needsAux) {
     return {
       ...prev,
       syncedAt: nowMs,
-      prs: [...open, ...(prev.prs || []).filter((pr) => pr.state !== "OPEN")],
+      prs: mergeByKey([carry, resolvedEnded, stillOpen, open]),
       daily: prev.daily || {},
       auxAt: prev.auxAt,
     };
   }
-  const openKeys = new Set(open.map((pr) => pr.key));
   const ended = await fetchEnded(slug, { exec, rules, nowMs, openKeys, prev });
   const createdRows = parseRows((await exec.runGh(createdArgs(slug, sinceDate(nowMs, 14)))).stdout);
   const daily = createdRows
@@ -194,7 +249,7 @@ export async function fetchRepo(slug, { exec, prev, rules, nowMs, meSet = new Se
   return {
     syncedAt: nowMs,
     auxAt: nowMs,
-    prs: [...open, ...ended],
+    prs: mergeByKey([carry, resolvedEnded, ended, stillOpen, open]),
     daily,
   };
 }
@@ -277,7 +332,40 @@ export function createSync({ exec, store, now = Date.now, viewer = fetchViewerLo
     });
     return running;
   }
-  return { run };
+  const meSetOf = (state) =>
+    new Set(
+      [state.runtime.ghLogin, ...state.cfg.extraAccounts]
+        .filter(Boolean)
+        .map((v) => String(v).toLowerCase()),
+    );
+  function findSnapshotPr(prKey) {
+    for (const [slug, snap] of Object.entries(store.getSnapshot().snapshots)) {
+      const pr = snap.prs.find((p) => p.key === prKey);
+      if (pr) return { slug, pr };
+    }
+    return null;
+  }
+  /** 单个 PR 重新读取并写回快照（抽屉里的「刷新状态」）。
+   *  与整体同步并发时先等它结束，避免旧结果覆盖新状态。 */
+  async function refreshPr(prKey) {
+    if (running) await running.catch(() => undefined);
+    const hit = findSnapshotPr(prKey);
+    if (!hit) return null;
+    const updated = await fetchPrByNumber(hit.slug, hit.pr.number, {
+      exec,
+      meSet: meSetOf(store.getSnapshot()),
+    });
+    if (!updated) return null;
+    const snap = store.getSnapshot().snapshots[hit.slug];
+    if (!snap) return null;
+    store.setSnapshot(hit.slug, {
+      ...snap,
+      prs: mergeByKey([snap.prs.filter((pr) => pr.key !== prKey), [updated]]),
+    });
+    if (onAfter) onAfter();
+    return updated;
+  }
+  return { run, refreshPr };
 }
 
 function createSchedulerApi(box, { run, now, isForeground, setTimer, clearTimer }) {

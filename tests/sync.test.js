@@ -5,16 +5,25 @@ import {
   clampInterval,
   createScheduler,
   createSync,
+  fetchPrByNumber,
   fetchRepo,
   needsDetail,
   sinceDate,
 } from "../src/sync.js";
 import { createStore } from "../src/store.js";
+import { assertReadOnlyArgs } from "../src/gh/exec.js";
+import { prByNumberArgs } from "../src/gh/queries.js";
 import { DEFAULT_RULES } from "../src/constants.js";
 import { NOW } from "./helpers.js";
 
 const fixture = (name) =>
   JSON.parse(readFileSync(new URL(`./fixtures/${name}`, import.meta.url), "utf8"));
+
+/** 把列表行改写成“已合并”的单 PR 查询结果。 */
+function mergedRowFor(number) {
+  const row = fixture("graphql-list.json").prs.find((item) => item[0] === number);
+  return [[...row.slice(0, 13), "MERGED", "2026-10-27T05:00:00Z", "2026-10-27T05:00:00Z"]];
+}
 
 function fakeExec(overrides = {}) {
   const calls = [];
@@ -259,4 +268,108 @@ test("fetchRepo：已结束/每日统计 30 分钟内复用，减少 gh 调用",
     nowMs: NOW + 31 * 60_000,
   });
   assert.equal(thirdExec.calls.filter((args) => args[1] === "list").length, 3);
+});
+
+test("prByNumberArgs：参数通过只读白名单，非法编号被拒绝", () => {
+  assert.doesNotThrow(() => assertReadOnlyArgs(prByNumberArgs("acme/repo", 1446)));
+  const query = prByNumberArgs("acme/repo", 1446).find((arg) => arg.startsWith("query="));
+  assert.match(query, /pullRequest\(number: 1446\)/);
+  assert.throws(() => prByNumberArgs("acme/repo", "abc"), /无效的 PR 编号/);
+});
+
+test("fetchPrByNumber：按编号直查合并状态，不依赖已结束列表缓存", async () => {
+  const calls = [];
+  const exec = {
+    runGh: async (args) => {
+      calls.push(args);
+      const query = args.find((a) => a.startsWith("query=")) || "";
+      if (/pullRequest\(number: \d+\)/.test(query)) {
+        return { code: 0, stdout: JSON.stringify(fixture("graphql-pr-by-number-merged.json")), stderr: "" };
+      }
+      return { code: 0, stdout: JSON.stringify(fixture("graphql-detail.json")), stderr: "" };
+    },
+  };
+  const pr = await fetchPrByNumber("zhukunpenglinyutong/desktop-cc-gui", 1446, { exec });
+  assert.equal(pr.key, "zhukunpenglinyutong/desktop-cc-gui#1446");
+  assert.equal(pr.state, "MERGED");
+  assert.equal(pr.mergedAt, Date.parse("2026-10-27T04:00:00Z"));
+  assert.ok(pr.events.some((event) => event.type === "merged"));
+  assert.equal(calls.length, 1, "合并态无需再拉详情");
+});
+
+test("fetchRepo：open 列表消失的 PR 按编号核对，合并状态不等 30 分钟缓存", async () => {
+  const slug = "zhukunpenglinyutong/desktop-cc-gui";
+  const first = await fetchRepo(slug, {
+    exec: fakeExec(),
+    prev: null,
+    rules: DEFAULT_RULES,
+    nowMs: NOW,
+  });
+  const listed = fixture("graphql-list.json");
+  const prs = listed.prs.filter((row) => row[0] !== 1437);
+  const mergedRow = mergedRowFor(1437);
+  const calls = [];
+  const exec = {
+    runGh: async (args) => {
+      calls.push(args);
+      const query = args.find((a) => a.startsWith("query=")) || "";
+      if (query.includes("pullRequests(states:OPEN")) {
+        return { code: 0, stdout: JSON.stringify({ ...listed, prs }), stderr: "" };
+      }
+      if (/pullRequest\(number: \d+\)/.test(query)) {
+        return { code: 0, stdout: JSON.stringify(mergedRow), stderr: "" };
+      }
+      if (args[1] === "list") throw new Error("已结束列表不应在 30 分钟缓存内被调用");
+      return { code: 0, stdout: JSON.stringify(fixture("graphql-detail.json")), stderr: "" };
+    },
+  };
+  const second = await fetchRepo(slug, {
+    exec,
+    prev: first,
+    rules: DEFAULT_RULES,
+    nowMs: NOW + 60_000,
+  });
+  const merged = second.prs.find((pr) => pr.number === 1437);
+  assert.ok(merged, "合并的 PR 不能从看板消失");
+  assert.equal(merged.state, "MERGED");
+  assert.equal(calls.filter((args) => args[1] === "list").length, 0);
+  const keys = second.prs.map((pr) => pr.key);
+  assert.equal(new Set(keys).size, keys.length);
+});
+
+test("createSync.refreshPr：单 PR 重读后写回快照并触发刷新", async () => {
+  const slug = "zhukunpenglinyutong/desktop-cc-gui";
+  const store = createStore({ load: async () => null, save: async () => {}, debounceMs: 0 });
+  await store.init();
+  const first = await fetchRepo(slug, {
+    exec: fakeExec(),
+    prev: null,
+    rules: DEFAULT_RULES,
+    nowMs: NOW,
+  });
+  store.setSnapshot(slug, first);
+  const exec = {
+    runGh: async (args) => {
+      const query = args.find((a) => a.startsWith("query=")) || "";
+      assert.match(query, /pullRequest\(number: 1437\)/);
+      return { code: 0, stdout: JSON.stringify(mergedRowFor(1437)), stderr: "" };
+    },
+  };
+  let after = 0;
+  const sync = createSync({
+    exec,
+    store,
+    now: () => NOW,
+    viewer: async () => "me",
+    onAfter: () => {
+      after += 1;
+    },
+  });
+  const updated = await sync.refreshPr(`${slug}#1437`);
+  assert.equal(updated.state, "MERGED");
+  assert.equal(after, 1);
+  const prs = store.getSnapshot().snapshots[slug].prs;
+  assert.equal(prs.find((pr) => pr.number === 1437).state, "MERGED");
+  const keys = prs.map((pr) => pr.key);
+  assert.equal(new Set(keys).size, keys.length);
 });
