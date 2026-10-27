@@ -7,6 +7,7 @@ import { duration, shortWhy } from "../domain/text.js";
 import { linkSource, wtFor } from "../domain/link.js";
 import { COLUMNS, MARK_TEXT } from "../constants.js";
 import { ownerLabel } from "../i18n.js";
+import { useScrollMemory } from "./scroll.js";
 
 const MARK_EN = {
   changes: "changes needed",
@@ -291,6 +292,8 @@ function BoardColumn({ t, col, defs, visible, order, endedDays, now, drag, over,
   const overdue = sorted.filter((r) => r.f.overdue).length;
   const plan = drag?.plans[col.key];
   const showPlaceholder = drag && over?.col === col.key && over.ok;
+  // 每列各自记住滚动位置：新建 / 关联 worktree 后卡片会换列或换序，列别跳回顶部。
+  const body = useScrollMemory(`col:${col.key}`);
   const hint = drag
     ? plan?.reorder
       ? t("列内拖动 = 调整顺序", "Same column = reorder")
@@ -310,6 +313,7 @@ function BoardColumn({ t, col, defs, visible, order, endedDays, now, drag, over,
       "div",
       {
         className: "ght-bcol-body",
+        ref: body,
         onDragOver: (event) => onColumnOver(event, col.key),
         onDrop: (event) => onDrop(event, col.key),
         onDragLeave: (event) => {

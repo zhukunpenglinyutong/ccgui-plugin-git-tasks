@@ -8,6 +8,7 @@ import { ListView } from "./ListView.js";
 import { Drawer } from "./Drawer.js";
 import { SettingsModal, SettingsBody } from "./SettingsModal.js";
 import { BindModal } from "./BindModal.js";
+import { useScrollMemory } from "./scroll.js";
 import { counts, dailySeries, dayStart, flowByDay, selectRows, todayFlow } from "../domain/stats.js";
 import { prUrl } from "../domain/text.js";
 import { describeGhError } from "../gh/exec.js";
@@ -286,9 +287,11 @@ function nextRepoFilter(state, enabledRepos, slug) {
 
 function PanelContent({ t, store, model }) {
   const { state, rows, enabledRepos, selectedSlugs, now, actions, c, flow, chart, flows, workspaces, prs, filterFn, showToast } = model;
+  // 面板主体按视图各记一份滚动位置：宿主重挂 / 内容塌陷后回到用户原来的位置。
+  const scroller = useScrollMemory(`panel:${state.ui.view}`);
   return h(
     "div",
-    { className: "ght-scroller" },
+    { className: "ght-scroller", ref: scroller },
     h(
       "div",
       { className: "ght-pv" },

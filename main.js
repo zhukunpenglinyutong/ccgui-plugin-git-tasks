@@ -1283,10 +1283,10 @@ function openedFirst(a, b) {
   return a.at - b.at;
 }
 function createPersistence({ save, debounceMs, schedule, cancel }) {
-  const pending = /* @__PURE__ */ new Map();
+  const pending2 = /* @__PURE__ */ new Map();
   const timers = /* @__PURE__ */ new Map();
   const queueSave = (key, value) => {
-    pending.set(key, value);
+    pending2.set(key, value);
     if (timers.has(key)) return;
     timers.set(key, schedule(() => {
       timers.delete(key);
@@ -1294,9 +1294,9 @@ function createPersistence({ save, debounceMs, schedule, cancel }) {
     }, debounceMs));
   };
   const flushKey = (key) => {
-    if (!pending.has(key)) return;
-    const value = pending.get(key);
-    pending.delete(key);
+    if (!pending2.has(key)) return;
+    const value = pending2.get(key);
+    pending2.delete(key);
     const timer = timers.get(key);
     if (timer) {
       cancel(timer);
@@ -1304,10 +1304,10 @@ function createPersistence({ save, debounceMs, schedule, cancel }) {
     }
     Promise.resolve(save(key, value)).catch(() => void 0);
   };
-  const flush = () => {
-    for (const key of [...pending.keys()]) flushKey(key);
+  const flush2 = () => {
+    for (const key of [...pending2.keys()]) flushKey(key);
   };
-  return { queueSave, flush };
+  return { queueSave, flush: flush2 };
 }
 function createCore(options) {
   const { load, save, now, debounceMs, schedule, cancel } = options;
@@ -2746,6 +2746,90 @@ function DailyChart({ t, series, days, flow, rules, mode, onMode }) {
   );
 }
 
+// src/ui/scroll.js
+var PREFIX = "ght.scroll.";
+var memory = /* @__PURE__ */ new Map();
+var pending = /* @__PURE__ */ new Map();
+var flushTimer = null;
+function readPos(key) {
+  if (memory.has(key)) return memory.get(key);
+  let value = 0;
+  try {
+    value = Number(sessionStorage.getItem(PREFIX + key)) || 0;
+  } catch {
+    value = 0;
+  }
+  memory.set(key, value);
+  return value;
+}
+function flush() {
+  flushTimer = null;
+  if (!pending.size) return;
+  try {
+    for (const [key, value] of pending) sessionStorage.setItem(PREFIX + key, String(value));
+  } catch {
+  }
+  pending.clear();
+}
+function writePos(key, value) {
+  if (readPos(key) === value) return;
+  memory.set(key, value);
+  pending.set(key, value);
+  if (flushTimer !== null) return;
+  flushTimer = setTimeout(flush, 150);
+}
+if (typeof window !== "undefined") window.addEventListener("pagehide", flush);
+var INPUT_EVENTS = ["wheel", "touchmove", "pointerdown", "keydown"];
+var INPUT_GRACE_MS = 400;
+var raf = typeof requestAnimationFrame === "function" ? (cb) => requestAnimationFrame(cb) : (cb) => setTimeout(cb, 16);
+var cancelRaf = typeof cancelAnimationFrame === "function" ? (id) => cancelAnimationFrame(id) : (id) => clearTimeout(id);
+function useScrollMemory(key) {
+  const ref = React.useRef(null);
+  React.useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return void 0;
+    let lastInput = 0;
+    let queued = 0;
+    const restore = () => {
+      const saved = readPos(key);
+      if (saved <= 0) return;
+      if (Math.abs(el.scrollTop - saved) < 1) return;
+      el.scrollTop = saved;
+    };
+    const restoreIfIdle = () => {
+      if (Date.now() - lastInput < INPUT_GRACE_MS) return;
+      if (queued) return;
+      queued = raf(() => {
+        queued = 0;
+        restore();
+      });
+    };
+    const onScroll = () => {
+      if (el.scrollTop === 0 && el.scrollHeight <= el.clientHeight + 1) return;
+      writePos(key, el.scrollTop);
+    };
+    const markInput = () => {
+      lastInput = Date.now();
+    };
+    restore();
+    el.addEventListener("scroll", onScroll, { passive: true });
+    for (const type of INPUT_EVENTS) el.addEventListener(type, markInput, { passive: true });
+    const resize = typeof ResizeObserver === "function" ? new ResizeObserver(restoreIfIdle) : null;
+    if (resize) resize.observe(el);
+    const mutate = typeof MutationObserver === "function" ? new MutationObserver(restoreIfIdle) : null;
+    if (mutate) mutate.observe(el, { childList: true, subtree: true });
+    return () => {
+      if (queued) cancelRaf(queued);
+      el.removeEventListener("scroll", onScroll);
+      for (const type of INPUT_EVENTS) el.removeEventListener(type, markInput);
+      if (resize) resize.disconnect();
+      if (mutate) mutate.disconnect();
+      flush();
+    };
+  }, [key]);
+  return ref;
+}
+
 // src/ui/Board.js
 var MARK_EN2 = {
   changes: "changes needed",
@@ -3014,6 +3098,7 @@ function BoardColumn({ t, col, defs, visible, order, endedDays, now, drag, over,
   const overdue = sorted.filter((r) => r.f.overdue).length;
   const plan = drag?.plans[col.key];
   const showPlaceholder = drag && over?.col === col.key && over.ok;
+  const body = useScrollMemory(`col:${col.key}`);
   const hint = drag ? plan?.reorder ? t("\u5217\u5185\u62D6\u52A8 = \u8C03\u6574\u987A\u5E8F", "Same column = reorder") : plan?.ok ? t(`\u653E\u4E0B = ${plan.text}`, `Drop = ${plan.text}`) : t(`\u4E0D\u80FD\u653E\uFF1A${plan?.text || ""}`, `Can't drop: ${plan?.text || ""}`) : "";
   return h(
     "section",
@@ -3027,6 +3112,7 @@ function BoardColumn({ t, col, defs, visible, order, endedDays, now, drag, over,
       "div",
       {
         className: "ght-bcol-body",
+        ref: body,
         onDragOver: (event) => onColumnOver(event, col.key),
         onDrop: (event) => onDrop(event, col.key),
         onDragLeave: (event) => {
@@ -4634,9 +4720,10 @@ function nextRepoFilter(state, enabledRepos, slug) {
 }
 function PanelContent({ t, store, model }) {
   const { state, rows, enabledRepos, selectedSlugs, now, actions, c, flow, chart, flows, workspaces, prs, filterFn, showToast } = model;
+  const scroller = useScrollMemory(`panel:${state.ui.view}`);
   return h(
     "div",
-    { className: "ght-scroller" },
+    { className: "ght-scroller", ref: scroller },
     h(
       "div",
       { className: "ght-pv" },
