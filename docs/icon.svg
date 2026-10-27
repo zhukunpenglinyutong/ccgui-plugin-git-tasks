@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Git 任务管理">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2f6fe4"/>
+      <stop offset="0.52" stop-color="#5b5bd6"/>
+      <stop offset="1" stop-color="#9333ea"/>
+    </linearGradient>
+    <linearGradient id="glow" x1="0" y1="0" x2="0.9" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.28"/>
+      <stop offset="0.55" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="check" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#3b6fe0"/>
+      <stop offset="1" stop-color="#7c3aed"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="116" fill="url(#bg)"/>
+  <rect width="512" height="512" rx="116" fill="url(#glow)"/>
+  <g fill="none" stroke="#ffffff" stroke-width="34" stroke-linecap="round" stroke-linejoin="round">
+    <!-- 主干：两条待审分支汇入同一流程 -->
+    <path d="M168 392V150"/>
+    <path d="M168 250c0-55 45-92 104-92h44"/>
+    <!-- 右上分支，带一个提交节点 -->
+    <path d="M344 158v54"/>
+  </g>
+  <circle cx="168" cy="150" r="42" fill="#ffffff"/>
+  <circle cx="168" cy="392" r="42" fill="#ffffff"/>
+  <circle cx="344" cy="150" r="42" fill="#ffffff"/>
+  <circle cx="344" cy="230" r="30" fill="url(#check)" stroke="#ffffff" stroke-width="12"/>
+  <!-- 通过标记 -->
+  <path d="M331 230l10 10 18-21" fill="none" stroke="#ffffff" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

@@ -6,6 +6,7 @@
   "description": "CCGUI · Git 任务管理（PR 流转）插件源码与构建脚本",
   "scripts": {
     "build": "node scripts/build.mjs",
+    "assets": "node scripts/make-assets.mjs",
     "test": "node --test",
     "coverage": "node --test --experimental-test-coverage"
   },

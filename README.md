@@ -12,6 +12,19 @@
 
 只调用本机 `gh` CLI 的只读子命令。不调用 AI、不自动评论 / 批准 / 合并、不发通知、不写 GitHub。
 
+## 界面预览
+
+| 五列看板：每个 PR 球在谁手里 | PR 详情：为什么是这个状态 |
+|---|---|
+| [![五列看板](docs/screenshot-1.png)](docs/screenshot-1.png) | [![PR 详情](docs/screenshot-2.png)](docs/screenshot-2.png) |
+
+| 列表视图 + 今日流转 | 状态判定规则可调 |
+|---|---|
+| [![列表视图](docs/screenshot-3.png)](docs/screenshot-3.png) | [![状态判定规则](docs/screenshot-4.png)](docs/screenshot-4.png) |
+
+素材由 `npm run assets` 从当前 `src/ui` 真实组件渲染（jsdom → Chrome 2x 截图），
+数据是 `acme/*` 固定夹具，不含真实账号与评论。
+
 ## 安装
 
 ```bash
@@ -31,7 +44,7 @@ npm run build          # src/ → main.js（单文件 ESM）
 1. 公开仓库根目录必须有 `manifest.json`、`README.md`、`LICENSE` 与
    `.github/workflows/release.yml`（本仓库已就位；`dist/` 由构建生成、不入库）。
 2. `manifest.json` 已声明 `"repo": "zhukunpenglinyutong/ccgui-plugin-git-tasks"` 与 `"license": "MIT"`；
-   `icon` / `screenshots` 可选（放 `docs/`，市场详情页读取默认分支）。
+   `icon`（`docs/icon.png`）与 4 张 `screenshots` 也已声明，市场读取默认分支上的文件。
 3. 升 `version`（semver），提交后打**与 version 完全一致、无 `v` 前缀**的 tag：
    `git tag 1.0.0 && git push origin 1.0.0`。Release Action 会构建并附加
    `main.js` / `manifest.json` / `styles.css` / `checksums.txt`。
