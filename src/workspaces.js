@@ -15,7 +15,9 @@ export function mergeRepoList(existing, discovered) {
   return [...kept, ...added];
 }
 
-export function createWorkspaceIndex({ ctx, exec, store, onUpdate }) {
+const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+export function createWorkspaceIndex({ ctx, exec, store, onUpdate, now = Date.now, sleep = defaultSleep }) {
   let snapshot = { repos: [], worktrees: [], loading: false, error: null };
   const listeners = new Set();
 
@@ -52,5 +54,17 @@ export function createWorkspaceIndex({ ctx, exec, store, onUpdate }) {
     }
   }
 
-  return { getSnapshot, subscribe, refresh };
+  /** 宿主在创建 resolve 之后才异步刷新侧栏：反复刷新直到 worktree 出现（最多 timeoutMs）。 */
+  async function waitForWorktree(path, { timeoutMs = 5000, intervalMs = 400 } = {}) {
+    const deadline = now() + timeoutMs;
+    for (;;) {
+      const snap = await refresh();
+      const hit = snap.worktrees.find((w) => w.path === path);
+      if (hit) return hit;
+      if (now() >= deadline) return null;
+      await sleep(intervalMs);
+    }
+  }
+
+  return { getSnapshot, subscribe, refresh, waitForWorktree };
 }

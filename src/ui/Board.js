@@ -45,6 +45,7 @@ function WorktreeButton({ t, wt, pr, bindings, rules, onWorktree, onBind, ended 
       },
       h(Icon, { name: "branch", size: 12 }),
       wt.name,
+      wt.auto ? h("span", { className: "ght-wt-auto" }, t("自动 · 已就绪", "auto · ready")) : null,
     );
   }
   if (ended) return null;

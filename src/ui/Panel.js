@@ -8,6 +8,9 @@ import { ListView } from "./ListView.js";
 import { Drawer } from "./Drawer.js";
 import { SettingsModal, SettingsBody } from "./SettingsModal.js";
 import { BindModal } from "./BindModal.js";
+import { AutoBanner } from "./AutoBanner.js";
+import { autoFlags } from "../domain/autowt.js";
+import { decoratedPrs, meSetOf, reposEnabledOf } from "../rows.js";
 import { useScrollMemory } from "./scroll.js";
 import { counts, dailySeries, dayStart, flowByDay, selectRows, todayFlow } from "../domain/stats.js";
 import { prUrl } from "../domain/text.js";
@@ -50,34 +53,19 @@ function useToast() {
 
 function useTrackedRows(store, index, now) {
   const state = useStore(store);
-  const workspaces = useStore(index);
-  const repoIndexMap = React.useMemo(
-    () => new Map(state.cfg.repos.map((r, i) => [r.slug, i])),
-    [state.cfg.repos],
+  const indexSnap = useStore(index);
+  // 插件自动建的 worktree 带 auto 标记：不算审查中，卡片 / 详情里能看出来。
+  const workspaces = React.useMemo(
+    () => ({ ...indexSnap, worktrees: autoFlags(indexSnap.worktrees, state.auto) }),
+    [indexSnap, state.auto],
   );
-  const ignoredSet = React.useMemo(() => new Set(state.local.ignored), [state.local.ignored]);
-  const prs = React.useMemo(() => {
-    const ignored = ignoredSet;
-    return store.allPrs().map((pr) => ({
-      ...pr,
-      ignored: ignored.has(pr.key),
-      repoIndex: repoIndexMap.get(pr.repoSlug) ?? 0,
-    }));
-  }, [state.snapshots, state.local.marks, ignoredSet, repoIndexMap, store]);
-  const meSet = React.useMemo(
-    () =>
-      new Set(
-        [state.runtime.ghLogin, ...state.cfg.extraAccounts]
-          .filter(Boolean)
-          .map((v) => String(v).toLowerCase()),
-      ),
-    [state.runtime.ghLogin, state.cfg.extraAccounts],
+  // 与入口计数 / 自动化共用 rows.js 的口径。
+  const prs = React.useMemo(
+    () => decoratedPrs(state, store.allPrs()),
+    [state.snapshots, state.local.marks, state.local.ignored, state.cfg.repos, store],
   );
-  const reposEnabled = React.useMemo(() => {
-    const map = {};
-    for (const repo of state.cfg.repos) map[repo.slug] = repo.enabled && repo.available !== false;
-    return map;
-  }, [state.cfg.repos]);
+  const meSet = React.useMemo(() => meSetOf(state), [state.runtime.ghLogin, state.cfg.extraAccounts]);
+  const reposEnabled = React.useMemo(() => reposEnabledOf(state), [state.cfg.repos]);
   const rows = React.useMemo(
     () =>
       selectRows(prs, {
@@ -285,7 +273,7 @@ function nextRepoFilter(state, enabledRepos, slug) {
   return !ordered.length || ordered.length === all.length ? "all" : ordered;
 }
 
-function PanelContent({ t, store, model }) {
+function PanelContent({ t, store, model, auto }) {
   const { state, rows, enabledRepos, selectedSlugs, now, actions, c, flow, chart, flows, workspaces, prs, filterFn, showToast } = model;
   // 面板主体按视图各记一份滚动位置：宿主重挂 / 内容塌陷后回到用户原来的位置。
   const scroller = useScrollMemory(`panel:${state.ui.view}`);
@@ -309,6 +297,7 @@ function PanelContent({ t, store, model }) {
         onOpenSettings: () => store.setUi({ modal: "settings" }),
         onPickRepo: (slug) => store.setUi({ repoFilter: nextRepoFilter(state, enabledRepos, slug) }),
       }),
+      h(AutoBanner, { t, store, state, auto, onOpenSettings: () => store.setUi({ modal: "settings" }) }),
       h(Kpis, {
         t,
         c,
@@ -339,18 +328,20 @@ function PanelContent({ t, store, model }) {
   );
 }
 
-export function createPanel({ ctx, t, store, index, exec, sync }) {
+export function createPanel({ ctx, t, store, index, exec, sync, auto, digest }) {
   function Panel() {
     const model = usePanelModel({ store, index, exec, sync, t });
     return h(
       "div",
       { className: "ght-root" },
-      h(PanelContent, { t, store, model }),
+      h(PanelContent, { t, store, model, auto }),
       h(Overlays, {
         t,
         ctx,
         store,
         index,
+        auto,
+        digest,
         state: model.state,
         now: model.now,
         prs: model.prs,
@@ -366,7 +357,7 @@ export function createPanel({ ctx, t, store, index, exec, sync }) {
   return Panel;
 }
 
-function DrawerLayer({ t, ctx, store, index, state, now, prs, workspaces, selectedPr, showToast, actions }) {
+function DrawerLayer({ t, ctx, store, index, auto, state, now, prs, workspaces, selectedPr, showToast, actions }) {
   if (!selectedPr) return null;
   return h(Drawer, {
     t,
@@ -386,10 +377,12 @@ function DrawerLayer({ t, ctx, store, index, state, now, prs, workspaces, select
     onRefresh: () => actions.refreshPr(selectedPr),
     onBind: actions.openBind,
     onWorktree: actions.onWorktree,
+    onAdopt: auto ? (key) => auto.adopt(key) : null,
+    checkDirty: auto ? (path) => auto.isDirty(path) : null,
   });
 }
 
-function SettingsLayer({ t, ctx, store, index, state, now, counts, showToast, actions }) {
+function SettingsLayer({ t, ctx, store, index, auto, digest, state, now, counts, showToast, actions }) {
   if (state.ui.modal !== "settings") return null;
   return h(SettingsModal, {
     t,
@@ -403,10 +396,12 @@ function SettingsLayer({ t, ctx, store, index, state, now, counts, showToast, ac
     toast: showToast,
     onSync: actions.syncNow,
     onClose: () => store.setUi({ modal: null, drawerKey: null }),
+    auto,
+    digest,
   });
 }
 
-function BindLayer({ t, ctx, store, index, state, prs, workspaces, showToast }) {
+function BindLayer({ t, ctx, store, index, auto, state, prs, workspaces, showToast }) {
   const bindPr = state.ui.modal?.prKey ? prs.find((p) => p.key === state.ui.modal.prKey) : null;
   if (state.ui.modal?.type !== "bind" || !bindPr) return null;
   return h(BindModal, {
@@ -420,17 +415,18 @@ function BindLayer({ t, ctx, store, index, state, prs, workspaces, showToast }) 
     bindings: state.local.bindings,
     rules: state.cfg.rules,
     toast: showToast,
+    auto,
     onClose: () => store.setUi({ modal: null, drawerKey: null }),
   });
 }
 
-function Overlays({ t, ctx, store, index, state, now, prs, workspaces, selectedPr, counts, toast, showToast, actions }) {
+function Overlays({ t, ctx, store, index, auto, digest, state, now, prs, workspaces, selectedPr, counts, toast, showToast, actions }) {
   return h(
     React.Fragment,
     null,
-    h(DrawerLayer, { t, ctx, store, index, state, now, prs, workspaces, selectedPr, showToast, actions }),
-    h(SettingsLayer, { t, ctx, store, index, state, now, counts, showToast, actions }),
-    h(BindLayer, { t, ctx, store, index, state, prs, workspaces, showToast }),
+    h(DrawerLayer, { t, ctx, store, index, auto, state, now, prs, workspaces, selectedPr, showToast, actions }),
+    h(SettingsLayer, { t, ctx, store, index, auto, digest, state, now, counts, showToast, actions }),
+    h(BindLayer, { t, ctx, store, index, auto, state, prs, workspaces, showToast }),
     h(Toast, { toast, t }),
   );
 }

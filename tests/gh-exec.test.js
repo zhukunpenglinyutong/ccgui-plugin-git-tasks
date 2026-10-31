@@ -227,3 +227,24 @@ test("网络错误重试耗尽后抛旧错误", async () => {
     (error) => error instanceof GhError && error.kind === "network",
   );
 });
+
+test("git 白名单：只放行只读的 status --porcelain（清理前检查未提交改动）", async () => {
+  assert.doesNotThrow(() => assertGitArgs(["-C", "/tmp/wt", "status", "--porcelain", "--ignore-submodules=none"]));
+  assert.throws(() => assertGitArgs(["-C", "/tmp/wt", "status"]), /status --porcelain/);
+  assert.throws(() => assertGitArgs(["-C", "/tmp/wt", "status", "--porcelain"]), /status --porcelain/);
+  assert.throws(() => assertGitArgs(["-C", "/tmp/wt", "status", "--porcelain", "--ignored"]), /status --porcelain/);
+  assert.throws(() => assertGitArgs(["-C", "/tmp/wt", "stash"]), /remote get-url/);
+  const calls = [];
+  const exec = createExec({
+    invoke: async (_cmd, payload) => {
+      calls.push(payload.args);
+      return { code: 0, stdout: payload.args[1] === "/dirty" ? " M src/a.js\n" : "", stderr: "" };
+    },
+  });
+  assert.equal(await exec.isDirty("/dirty"), true);
+  assert.equal(await exec.isDirty("/clean"), false);
+  assert.equal(await exec.isDirty(""), true, "空路径会落到当前目录：按有改动处理");
+  assert.equal(await exec.isDirty("relative/wt"), true);
+  assert.deepEqual(calls[0], ["-C", "/dirty", "status", "--porcelain", "--ignore-submodules=none"]);
+  assert.equal(calls.length, 2);
+});

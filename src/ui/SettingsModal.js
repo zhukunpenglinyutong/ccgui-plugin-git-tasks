@@ -5,6 +5,8 @@ import { React } from "./react.js";
 import { Icon, cx, h } from "./common.js";
 import { DEFAULT_DEFS, STATUS_ORDER, TONES } from "../constants.js";
 import { ownerLabel } from "../i18n.js";
+import { AutomationSection } from "./AutomationSection.js";
+import { Row, Section, Seg, Switch } from "./settingsKit.js";
 
 const pad = (n) => String(n).padStart(2, "0");
 
@@ -17,51 +19,10 @@ const SECTIONS = [
   ["board", "看板", "Board"],
   ["wt", "Worktree 徽标", "Worktree badges"],
   ["sync", "同步与统计", "Sync & stats"],
+  ["auto", "自动化", "Automation"],
   ["local", "本地数据", "Local data"],
   ["roadmap", "路线图", "Roadmap"],
 ];
-
-function Row({ label, hint, children, stack }) {
-  return h(
-    "div",
-    { className: cx("ght-srow", stack && "ght-srow-stack") },
-    h(
-      "div",
-      null,
-      h("div", { className: "ght-lab" }, label),
-      hint ? h("div", { className: "ght-hint" }, hint) : null,
-    ),
-    stack ? h("div", { className: "ght-stack-body" }, children) : h("div", null, children),
-  );
-}
-
-function Switch({ checked, onChange, label }) {
-  return h(
-    "label",
-    { className: "ght-sw", "aria-label": label },
-    h("input", { type: "checkbox", checked, onChange: (e) => onChange(e.target.checked) }),
-    h("i", null),
-  );
-}
-
-function Seg({ value, options, onChange }) {
-  return h(
-    "div",
-    { className: "ght-seg" },
-    options.map(([v, label]) =>
-      h(
-        "button",
-        {
-          key: String(v),
-          type: "button",
-          className: cx(String(value) === String(v) && "on"),
-          onClick: () => onChange(v),
-        },
-        label,
-      ),
-    ),
-  );
-}
 
 function Num({ value, onChange, suffix }) {
   return h(
@@ -76,15 +37,6 @@ function Num({ value, onChange, suffix }) {
       onChange: (event) => onChange(Math.max(0, Math.min(99, Number(event.target.value) || 0))),
     }),
     suffix,
-  );
-}
-
-function Section({ id, title, sub, children }) {
-  return h(
-    "div",
-    { className: "ght-sec", "data-sec": id, id: `ght-sec-${id}` },
-    h("div", { className: "ght-sec-h2" }, h("h4", null, title), sub ? h("span", null, sub) : null),
-    h("div", { className: "ght-sec-box" }, children),
   );
 }
 
@@ -444,10 +396,10 @@ const ROADMAP = [
     key: "notify",
     tone: "neutral",
     status: ["后续", "Later"],
-    title: ["飞书 / 系统通知", "Feishu / system notifications"],
+    title: ["系统通知", "System notifications"],
     desc: [
-      "PR 超时、作者修复、重新请求审查时推送；需要网络与通知权限。",
-      "Notify on overdue PRs, author fixes and re-review requests; needs network and notification permissions.",
+      "飞书每小时汇总已在「自动化」里提供；系统通知（PR 超时、作者修复时即时弹出）仍在规划。",
+      "The hourly Feishu digest ships under Automation; instant system notifications are still planned.",
     ],
   },
   {
@@ -548,7 +500,7 @@ function useSectionSpy(active, setActive) {
   return { bodyRef, scrollTo, onScroll };
 }
 
-export function SettingsBody({ t, ctx, store, index, rules, defs, counts, now, toast, onSync }) {
+export function SettingsBody({ t, ctx, store, index, rules, defs, counts, now, toast, onSync, auto, digest }) {
   void ctx;
   void now;
   const [active, setActive] = React.useState("src");
@@ -570,6 +522,7 @@ export function SettingsBody({ t, ctx, store, index, rules, defs, counts, now, t
       h(BoardSection, shared),
       h(BadgeSection, shared),
       h(SyncSection, shared),
+      h(AutomationSection, { ...shared, auto, digest }),
       h(LocalSection, shared),
       h(RoadmapSection, { t }),
       h("div", { className: "ght-m-foot-note" }, t("同一份设置也在「客户端设置 › 插件 › CCGUI · Git 任务管理」", "The same settings live under Settings › Plugins")),
@@ -577,7 +530,7 @@ export function SettingsBody({ t, ctx, store, index, rules, defs, counts, now, t
   );
 }
 
-export function SettingsModal({ t, ctx, store, index, rules, defs, counts, now, toast, onClose, onSync }) {
+export function SettingsModal({ t, ctx, store, index, rules, defs, counts, now, toast, onClose, onSync, auto, digest }) {
   return [
     h("div", { key: "scrim", className: "ght-mscrim", onClick: onClose }),
     h(
@@ -590,8 +543,8 @@ export function SettingsModal({ t, ctx, store, index, rules, defs, counts, now, 
         h("span", { className: "ght-sp" }),
         h("button", { type: "button", className: "ght-icon-btn ght-bare", onClick: onClose, title: t("关闭（Esc）", "Close (Esc)") }, h(Icon, { name: "x", size: 15 })),
       ),
-      h(SettingsBody, { t, ctx, store, index, rules, defs, counts, now, toast, onSync }),
-      h("div", { className: "ght-m-foot" }, h("span", { className: "ght-m-note" }, t("只读 gh · 不写 GitHub", "read-only gh · no writes")), h("span", { className: "ght-sp" }), h("button", { type: "button", className: "ght-btn ght-btn-pri", onClick: onClose }, t("完成", "Done"))),
+      h(SettingsBody, { t, ctx, store, index, rules, defs, counts, now, toast, onSync, auto, digest }),
+      h("div", { className: "ght-m-foot" }, h("span", { className: "ght-m-note" }, t("只读 gh · 不写 GitHub · 飞书汇总需手动开启", "read-only gh · no GitHub writes · Feishu digest is opt-in")), h("span", { className: "ght-sp" }), h("button", { type: "button", className: "ght-btn ght-btn-pri", onClick: onClose }, t("完成", "Done"))),
     ),
   ];
 }

@@ -5,7 +5,23 @@
  * UI 状态不进持久化。所有写入替换对象，不改旧快照。
  */
 
-import { DAY, DEFAULT_DEFS, DEFAULT_RULES, STORE_VERSION, TONES } from "./constants.js";
+import {
+  DAY,
+  DEFAULT_AUTOMATION,
+  DEFAULT_DEFS,
+  DEFAULT_NOTIFY,
+  DEFAULT_RULES,
+  STORE_VERSION,
+  TONES,
+} from "./constants.js";
+import {
+  emptyNotifyState,
+  sanitizeAutoRecords,
+  sanitizeAutomation,
+  sanitizeFeishu,
+  sanitizeNotifyCfg,
+  sanitizeNotifyState,
+} from "./automation/config.js";
 import { applyDrop } from "./domain/board.js";
 
 const LOCAL_EMPTY = () => ({ marks: {}, bindings: {}, order: {}, ignored: [], reviewing: {} });
@@ -16,6 +32,8 @@ export function defaultConfig(repos = []) {
     defs: { ...DEFAULT_DEFS },
     repos: repos.map((r) => ({ slug: r.slug, enabled: r.enabled !== false })),
     extraAccounts: [],
+    automation: { ...DEFAULT_AUTOMATION },
+    notify: { ...DEFAULT_NOTIFY },
   };
 }
 
@@ -25,6 +43,10 @@ function initialState() {
     cfg: defaultConfig(),
     snapshots: {},
     local: LOCAL_EMPTY(),
+    // 自动化数据各存独立 key：「清空本地数据」「恢复默认设置」都不会误删。
+    auto: {},
+    feishu: { webhook: "", secret: "" },
+    notify: emptyNotifyState(),
     runtime: {
       syncing: false,
       syncStartedAt: null,
@@ -120,6 +142,8 @@ function migrateConfig(raw) {
     rules: sanitizeRules(raw.rules),
     defs: sanitizeDefs(raw.defs),
     extraAccounts: Array.isArray(raw.extraAccounts) ? raw.extraAccounts.map(String).filter(Boolean) : [],
+    automation: sanitizeAutomation(raw.automation),
+    notify: sanitizeNotifyCfg(raw.notify),
   };
 }
 
@@ -208,7 +232,9 @@ function createCore(options) {
 }
 
 async function loadState(core) {
-  const [rawCfg, rawLocal] = await Promise.all([core.load("cfg"), core.load("local")]);
+  const [rawCfg, rawLocal, rawAuto, rawFeishu, rawNotify] = await Promise.all(
+    ["cfg", "local", "auto", "feishu", "notify"].map((key) => core.load(key)),
+  );
   const cfg = migrateConfig(rawCfg) || defaultConfig();
   const local = migrateLocal(rawLocal);
   const snapshots = {};
@@ -216,7 +242,16 @@ async function loadState(core) {
     const snap = migrateSnapshot(await core.load(`snap:${repo.slug}`));
     if (snap) snapshots[repo.slug] = snap;
   }
-  core.commit({ ...core.getState(), ready: true, cfg, local, snapshots });
+  core.commit({
+    ...core.getState(),
+    ready: true,
+    cfg,
+    local,
+    snapshots,
+    auto: sanitizeAutoRecords(rawAuto),
+    feishu: sanitizeFeishu(rawFeishu),
+    notify: sanitizeNotifyState(rawNotify),
+  });
 }
 
 function createConfigApi(core) {
@@ -239,6 +274,10 @@ function createConfigApi(core) {
         })),
       }),
     setExtraAccounts: (list) => updateCfg({ extraAccounts: [...list] }),
+    setAutomation: (patch) =>
+      updateCfg({ automation: sanitizeAutomation({ ...core.getState().cfg.automation, ...patch }) }),
+    setNotifyCfg: (patch) =>
+      updateCfg({ notify: sanitizeNotifyCfg({ ...core.getState().cfg.notify, ...patch }) }),
     resetConfig: () => updateCfg(defaultConfig(core.getState().cfg.repos)),
   };
 }
@@ -366,6 +405,30 @@ function createBindingApi(core, data, local) {
   return { bind, unbind, pruneBindings, toggleIgnore, applyDropLocal, markReviewing, clearReviewing };
 }
 
+function createAutomationApi(core) {
+  const setAutoRecords = (records) => {
+    core.commit({ ...core.getState(), auto: records });
+    core.queueSave("auto", { v: STORE_VERSION, records });
+  };
+  const setAutoRecord = (prKey, record) => {
+    const next = { ...core.getState().auto };
+    if (record) next[prKey] = record;
+    else delete next[prKey];
+    setAutoRecords(next);
+  };
+  const setFeishu = (patch) => {
+    const feishu = sanitizeFeishu({ ...core.getState().feishu, ...patch });
+    core.commit({ ...core.getState(), feishu });
+    core.queueSave("feishu", feishu);
+  };
+  const setNotifyState = (patch) => {
+    const notify = { ...core.getState().notify, ...patch };
+    core.commit({ ...core.getState(), notify });
+    core.queueSave("notify", { v: STORE_VERSION, ...notify });
+  };
+  return { setAutoRecords, setAutoRecord, setFeishu, setNotifyState };
+}
+
 export function createStore({
   load = async () => null,
   save = async () => {},
@@ -379,6 +442,7 @@ export function createStore({
   const data = createDataApi(core);
   const local = createLocalApi(core);
   const bindings = createBindingApi(core, data, local);
+  const automation = createAutomationApi(core);
   const restoreLocal = (partial) =>
     local.updateLocal({ marks: partial.marks || {}, order: partial.order || {} });
   const clearLocal = () => local.updateLocal(LOCAL_EMPTY());
@@ -391,6 +455,7 @@ export function createStore({
     ...data,
     ...local,
     ...bindings,
+    ...automation,
     restoreLocal,
     clearLocal,
   };

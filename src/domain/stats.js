@@ -134,8 +134,9 @@ export function selectRows(prs, { rules, meSet, repoFilter = "all", reposEnabled
     .filter((pr) => isTracked(pr, rules, meSet))
     .filter((pr) => showIgnored || !pr.ignored)
     .map((pr) => {
+      // 插件自动建、你还没开始审查的 worktree 不算“审查中”。
       const hasWorktree = wts.some(
-        (wt) => linkPr(wt, { prs, bindings, rules })?.key === pr.key,
+        (wt) => !wt.auto && linkPr(wt, { prs, bindings, rules })?.key === pr.key,
       );
       const d = reviewingState(derive(pr, rules), hasWorktree, reviewingSince[pr.key]);
       return { pr, d, f: flags(d, rules, now) };

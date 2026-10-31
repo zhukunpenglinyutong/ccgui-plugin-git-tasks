@@ -61,13 +61,19 @@ export function assertReadOnlyArgs(args) {
 }
 
 export function assertGitArgs(args) {
-  const ok =
-    Array.isArray(args) &&
-    args.length === 5 &&
-    args[0] === "-C" &&
-    args[2] === "remote" &&
-    args[3] === "get-url";
-  if (!ok) throw new GhError("denied", "git 只允许 `git -C <path> remote get-url <remote>`");
+  const scoped = Array.isArray(args) && args[0] === "-C" && typeof args[1] === "string";
+  if (scoped && args[2] === "status") {
+    // 清理自动 worktree 前检查有没有未提交改动（宿主删除带 --force）。
+    if (args.length === 5 && args[3] === "--porcelain" && args[4] === "--ignore-submodules=none") return;
+    throw new GhError("denied", "git status 只允许 `git -C <path> status --porcelain --ignore-submodules=none`");
+  }
+  const ok = scoped && args.length === 5 && args[2] === "remote" && args[3] === "get-url";
+  if (!ok) {
+    throw new GhError(
+      "denied",
+      "git 只允许 `git -C <path> remote get-url <remote>` 与 `git -C <path> status --porcelain --ignore-submodules=none`",
+    );
+  }
 }
 
 function detectPlatform() {
@@ -189,6 +195,19 @@ export function createExec({
     return result;
   }
 
+  /** worktree 有没有未提交 / 未跟踪的改动；读不出来按“有改动”处理，宁可不删。 */
+  async function isDirty(path) {
+    const absolute = typeof path === "string" && (path.startsWith("/") || /^[A-Za-z]:[\\/]/.test(path));
+    if (!absolute) return true;
+    try {
+      // --ignore-submodules=none：不让仓库里的 .gitmodules 把子模块改动藏起来。
+      const result = await runGit(["-C", path, "status", "--porcelain", "--ignore-submodules=none"]);
+      return result.stdout.trim().length > 0;
+    } catch {
+      return true;
+    }
+  }
+
   async function openUrl(url) {
     const href = assertGitHubUrl(url);
     const [bin, args] = openerFor(platform, href);
@@ -199,7 +218,7 @@ export function createExec({
     return true;
   }
 
-  return { runGh, runGit, openUrl, stats };
+  return { runGh, runGit, isDirty, openUrl, stats };
 }
 
 /** 把 GhError 变成用户可读提示。 */

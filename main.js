@@ -85,6 +85,248 @@ var MIN_INTERVAL_MINUTES = 5;
 var GH_TIMEOUT_MS = 2e4;
 var GIT_TIMEOUT_MS = 15e3;
 var GH_CONCURRENCY = 1;
+var DEFAULT_AUTOMATION = {
+  autoWorktree: false,
+  autoWorktreeMax: 10,
+  // fork 来的 PR 任何人都能提；自动检出会触发本机 git 钩子（husky 等），默认不建。
+  autoWorktreeForks: false
+};
+var AUTO_WT_MAX_LIMIT = 50;
+var AUTO_WT_PER_RUN = 5;
+var AUTO_WT_MAX_ATTEMPTS = 2;
+var AUTO_WT_RETRY_MS = 30 * MINUTE;
+var AUTO_WT_BREAKER = 3;
+var AUTO_WT_MISSING_GRACE_MS = 10 * MINUTE;
+var DEFAULT_NOTIFY = {
+  feishu: false,
+  quiet: true,
+  quietStart: 22,
+  quietEnd: 8
+};
+var FEISHU_MAX_BYTES = 18e3;
+var DIGEST_CHANGES_PER_REPO = 15;
+var DIGEST_TICK_MS = MINUTE;
+
+// src/domain/link.js
+var PICK_ORDER = { free: 0, taken: 1, current: 2, host: 3 };
+function findBoundPr(wt, { prs, bindings }) {
+  const key = Object.keys(bindings).find((k) => bindings[k] === wt.workspaceId);
+  if (!key) return null;
+  return prs.find((p) => p.key === key) || null;
+}
+function linkPr(wt, { prs, bindings, rules }) {
+  const bound = findBoundPr(wt, { prs, bindings });
+  if (bound) return bound;
+  const sameRepo = prs.filter((p) => p.repoSlug === wt.repo);
+  if (rules.linkByPr && wt.prNumber != null) {
+    const byPr = sameRepo.find((p) => p.number === wt.prNumber);
+    if (byPr) return byPr;
+  }
+  if (rules.linkByBranch && wt.branch) {
+    const byBranch = sameRepo.find((p) => p.headRefName === wt.branch);
+    if (byBranch && !bindings[byBranch.key]) return byBranch;
+  }
+  return null;
+}
+function wtFor(pr, { wts, prs, bindings, rules }) {
+  const boundId = bindings[pr.key];
+  if (boundId) return wts.find((w) => w.workspaceId === boundId) || null;
+  return wts.find((w) => linkPr(w, { prs, bindings, rules })?.key === pr.key) || null;
+}
+function linkSource(wt, pr, bindings) {
+  if (wt.auto) return "\u63D2\u4EF6\u81EA\u52A8\u521B\u5EFA\uFF08\u672A\u5F00\u59CB\u5BA1\u67E5\uFF09";
+  if (bindings[pr.key] === wt.workspaceId) return "\u4F60\u624B\u52A8\u7ED1\u5B9A";
+  if (wt.prNumber === pr.number) return "\u5BA2\u6237\u7AEF\u4ECE PR \u521B\u5EFA";
+  return "\u5206\u652F\u540D\u4E0E PR \u4E00\u81F4";
+}
+function bindCandidates(pr, { wts, prs, bindings, rules }) {
+  return wts.filter((w) => w.repo === pr.repoSlug && !w.creating).map((wt) => {
+    const current = linkPr(wt, { prs, bindings, rules });
+    const manual = Object.values(bindings).includes(wt.workspaceId);
+    if (current && current.key === pr.key) {
+      return { wt, state: "current", text: "\u5F53\u524D\u5DF2\u5BF9\u5E94\u8FD9\u4E2A PR", disabled: true };
+    }
+    if (wt.prNumber != null && !manual) {
+      return { wt, state: "host", text: `\u5BA2\u6237\u7AEF\u4ECE #${wt.prNumber} \u521B\u5EFA`, disabled: true };
+    }
+    if (current) {
+      return { wt, state: "taken", text: `\u5DF2\u5BF9\u5E94 #${current.number}\uFF0C\u6539\u7ED1\u540E\u89E3\u9664`, disabled: false };
+    }
+    return { wt, state: "free", text: "\u7A7A\u95F2", disabled: false };
+  }).sort((a, b) => PICK_ORDER[a.state] - PICK_ORDER[b.state]);
+}
+function newBranchName(pr, random = Math.random) {
+  const suffix = String(Math.floor(random() * 1e3)).padStart(3, "0");
+  return `pr-${pr.number}-${suffix}`;
+}
+function reviewingState(d, hasWorktree, since) {
+  if (!hasWorktree || d.key !== "needs_review") return d;
+  return { ...d, key: "reviewing", since: since || d.since };
+}
+
+// src/domain/autowt.js
+var matchesRecord = (wt, record) => !!record.workspaceId && record.workspaceId === wt.workspaceId || !!record.path && record.path === wt.path;
+var matchesCreating = (wt, record) => record.status === "creating" && !!record.branch && wt.repo === record.repo && wt.branch === record.branch;
+function autoFlags(wts, records) {
+  const list = Object.values(records || {});
+  return (wts || []).map((wt) => ({
+    ...wt,
+    auto: list.some((r) => r.status === "created" && matchesRecord(wt, r) || matchesCreating(wt, r))
+  }));
+}
+function hasAnyWorktree(pr, { wts, prs, bindings, rules }) {
+  if (bindings[pr.key]) return true;
+  if (wtFor(pr, { wts, prs, bindings, rules })) return true;
+  return wts.some(
+    (w) => w.repo === pr.repoSlug && (w.prNumber != null && w.prNumber === pr.number || !!w.branch && w.branch === pr.headRefName)
+  );
+}
+function eligible(record, now) {
+  if (!record) return true;
+  if (record.status !== "failed") return false;
+  return record.attempts < AUTO_WT_MAX_ATTEMPTS && now - record.at >= AUTO_WT_RETRY_MS;
+}
+var byRecent = (a, b) => (b.updatedAt || 0) - (a.updatedAt || 0) || b.number - a.number;
+function skipReason(pr, ctx) {
+  if (!ctx.repoSlugs.has(pr.repoSlug)) return "noRepo";
+  if (ctx.skipSlugs.has(pr.repoSlug)) return "syncError";
+  if (ctx.meSet.has(String(pr.author || "").toLowerCase())) return "mine";
+  if (hasAnyWorktree(pr, ctx)) return "hasWorktree";
+  if (!ctx.includeForks && pr.isCrossRepository) return "fork";
+  const record = ctx.records[pr.key];
+  if (!eligible(record, ctx.now)) return record.status === "failed" ? "retryLater" : "record";
+  return null;
+}
+function pickAutoCandidates({
+  rows,
+  wts,
+  prs,
+  bindings,
+  rules,
+  records,
+  repoSlugs,
+  skipSlugs = /* @__PURE__ */ new Set(),
+  meSet = /* @__PURE__ */ new Set(),
+  includeForks = false,
+  max,
+  perRun = AUTO_WT_PER_RUN,
+  now
+}) {
+  const alive = wts.filter((w) => w.auto).length;
+  const remaining = Math.max(0, max - alive);
+  const ctx = { wts, prs, bindings, rules, records, repoSlugs, skipSlugs, meSet, includeForks, now };
+  const waitingReview = rows.filter((row) => row.d.key === "needs_review").map((row) => row.pr).filter((pr) => pr.state === "OPEN" && !pr.isDraft && !pr.ignored);
+  const skipped = {};
+  const pool = [];
+  for (const pr of waitingReview) {
+    const reason = skipReason(pr, ctx);
+    if (reason) skipped[reason] = (skipped[reason] || 0) + 1;
+    else pool.push(pr);
+  }
+  pool.sort(byRecent);
+  const take = Math.min(perRun, remaining);
+  return {
+    picks: pool.slice(0, take),
+    alive,
+    total: waitingReview.length,
+    eligible: pool.length,
+    skipped,
+    capped: remaining === 0 && pool.length > 0,
+    waiting: Math.max(0, pool.length - take)
+  };
+}
+var RENAME = /* @__PURE__ */ new Set(["branch_exists", "dir_exists", "branch_checked_out"]);
+var FATAL = /* @__PURE__ */ new Set([
+  "not_a_repo",
+  "repo_open_failed",
+  "invalid_branch",
+  "branch_not_found",
+  "pr_not_found",
+  "register_failed",
+  "sparse_checkout_empty",
+  "invalid_args"
+]);
+function classifyCreateError(message) {
+  const text2 = String(message || "").trim();
+  const kind = (/^([a-z_]+)(?::|$)/.exec(text2)?.[1] || "unknown").toLowerCase();
+  if (kind === "canceled") return { kind, action: "canceled" };
+  if (RENAME.has(kind)) return { kind, action: "rename" };
+  if (FATAL.has(kind)) return { kind, action: "give_up" };
+  return { kind, action: "retry" };
+}
+function recordAfterFailure(prev, message, now) {
+  const { action } = classifyCreateError(message);
+  const base = { ...prev, at: now, lastError: String(message || "unknown").slice(0, 300) };
+  if (action === "canceled") return { ...base, status: "canceled" };
+  if (action === "give_up") return { ...base, status: "gave_up" };
+  return { ...base, status: prev.attempts >= AUTO_WT_MAX_ATTEMPTS ? "gave_up" : "failed" };
+}
+function parentVisible(record, { repoSlugs, parentIds }) {
+  return record.parentId ? parentIds.has(record.parentId) : repoSlugs.has(record.repo);
+}
+function reconcileLive(record, ctx) {
+  const found = ctx.wts.find((w) => matchesRecord(w, record));
+  if (found) {
+    const same = found.workspaceId === record.workspaceId && found.path === record.path && !record.missingSince;
+    return same ? record : { ...record, workspaceId: found.workspaceId, path: found.path, missingSince: 0 };
+  }
+  if (!parentVisible(record, ctx)) return record;
+  if (!record.missingSince) return { ...record, missingSince: ctx.now };
+  return ctx.now - record.missingSince >= AUTO_WT_MISSING_GRACE_MS ? { ...record, status: "removed", missingSince: 0, at: ctx.now } : record;
+}
+function reconcileOne(key, record, ctx) {
+  const { wts, inFlight } = ctx;
+  if (record.status === "created" || record.status === "adopted") return reconcileLive(record, ctx);
+  const settling = record.status === "creating" || record.status === "failed" || record.status === "gave_up";
+  if (settling && !inFlight.has(key)) {
+    const found = wts.find((w) => w.repo === record.repo && !!record.branch && w.branch === record.branch);
+    if (found) {
+      const ours = record.status === "creating" || record.lastError === "interrupted";
+      return { ...record, status: ours ? "created" : "adopted", workspaceId: found.workspaceId, path: found.path, lastError: "" };
+    }
+    if (record.status === "creating") {
+      const spent = record.attempts >= AUTO_WT_MAX_ATTEMPTS;
+      return { ...record, status: spent ? "gave_up" : "failed", lastError: "interrupted" };
+    }
+  }
+  return record;
+}
+var KEEP_STATUSES = /* @__PURE__ */ new Set(["creating", "created", "adopted"]);
+function pruneRecords(records, livePrKeys, now, maxAgeMs) {
+  let changed = false;
+  const out = {};
+  for (const [key, record] of Object.entries(records || {})) {
+    if (!KEEP_STATUSES.has(record.status) && !livePrKeys.has(key) && now - record.at > maxAgeMs) {
+      changed = true;
+      continue;
+    }
+    out[key] = record;
+  }
+  return { records: changed ? out : records, changed };
+}
+function reconcileRecords({ records, wts, repoSlugs, parentIds = /* @__PURE__ */ new Set(), inFlight = /* @__PURE__ */ new Set(), now = 0 }) {
+  let changed = false;
+  const out = {};
+  const ctx = { wts, repoSlugs, parentIds, inFlight, now };
+  for (const [key, record] of Object.entries(records || {})) {
+    const next = reconcileOne(key, record, ctx);
+    if (next !== record) changed = true;
+    out[key] = next;
+  }
+  return { records: changed ? out : records, changed };
+}
+function cleanableAuto({ wts, records, prs }) {
+  const byKey = new Map(prs.map((p) => [p.key, p]));
+  const out = [];
+  for (const [key, record] of Object.entries(records || {})) {
+    if (record.status !== "created") continue;
+    const pr = byKey.get(key);
+    if (!pr || pr.state !== "MERGED" && pr.state !== "CLOSED") continue;
+    const wt = wts.find((w) => w.auto && matchesRecord(w, record));
+    if (wt) out.push({ prKey: key, pr, wt });
+  }
+  return out;
+}
 
 // src/domain/derive.js
 var VERDICT_TYPES = /* @__PURE__ */ new Set(["changes", "approve"]);
@@ -313,65 +555,1012 @@ function formatDuration(ms) {
   return h2 && d < 3 ? `${d}\u5929${h2}\u5C0F\u65F6` : `${d}\u5929`;
 }
 
-// src/domain/link.js
-var PICK_ORDER = { free: 0, taken: 1, current: 2, host: 3 };
-function findBoundPr(wt, { prs, bindings }) {
-  const key = Object.keys(bindings).find((k) => bindings[k] === wt.workspaceId);
-  if (!key) return null;
-  return prs.find((p) => p.key === key) || null;
+// src/domain/stats.js
+var pad = (n) => String(n).padStart(2, "0");
+function dayStart(now, cutoffH = 0) {
+  const d = new Date(now);
+  d.setHours(cutoffH, 0, 0, 0);
+  if (d.getTime() > now) d.setDate(d.getDate() - 1);
+  return d.getTime();
 }
-function linkPr(wt, { prs, bindings, rules }) {
-  const bound = findBoundPr(wt, { prs, bindings });
-  if (bound) return bound;
-  const sameRepo = prs.filter((p) => p.repoSlug === wt.repo);
-  if (rules.linkByPr && wt.prNumber != null) {
-    const byPr = sameRepo.find((p) => p.number === wt.prNumber);
-    if (byPr) return byPr;
+function dateKey(ms) {
+  const d = new Date(ms);
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+function counts(rows, { defs, rules, now, excluded = 0, statusOrder = STATUS_ORDER }) {
+  const live = rows.filter((r) => !r.pr.ignored);
+  const byStatus = {};
+  for (const key of statusOrder) byStatus[key] = 0;
+  for (const r of live) byStatus[r.d.key] = (byStatus[r.d.key] || 0) + 1;
+  const ownerOf = (r) => defs[r.d.key].owner;
+  const today = dayStart(now, rules.dayCutoff);
+  return {
+    ...byStatus,
+    all: live.length,
+    mine: live.filter((r) => ownerOf(r) === "me").length,
+    author: live.filter((r) => ownerOf(r) === "author").length,
+    merge: live.filter((r) => ownerOf(r) === "merge").length,
+    active: live.filter((r) => ownerOf(r) !== "done").length,
+    done: live.filter((r) => ownerOf(r) === "done").length,
+    today: live.filter((r) => r.pr.createdAt >= today).length,
+    mergedToday: live.filter((r) => r.d.key === "merged" && r.d.since >= today).length,
+    overdue: live.filter((r) => r.f.overdue).length,
+    silent: live.filter((r) => r.f.silent).length,
+    ignored: rows.length - live.length,
+    excluded
+  };
+}
+function flowForPr(pr, rules, start, s) {
+  let seen = 0;
+  let waiting = false;
+  for (const e of pr.events || []) {
+    const isToday = e.at >= start;
+    if (e.type === "opened") {
+      if (isToday) {
+        s.opened += 1;
+        const key = pr.repoSlug || pr.repo;
+        s.byRepo[key] = (s.byRepo[key] || 0) + 1;
+        if (e.draft || pr.isDraft) s.drafts += 1;
+      }
+      continue;
+    }
+    if (isToday && e.type === "merged") s.merged += 1;
+    if (isToday && e.type === "closed") s.closed += 1;
+    if (e.type === "mark" && e.verdict === "reset") {
+      waiting = false;
+      continue;
+    }
+    const verdict = verdictOf(e, rules);
+    if (verdict) {
+      if (isToday) {
+        s[seen ? "re" : "first"] += 1;
+        s[verdict === "changes" ? "changes" : "approve"] += 1;
+      }
+      seen += 1;
+      waiting = verdict === "changes";
+      continue;
+    }
+    if (waiting && isAuthorFix(e, rules)) {
+      if (isToday) s.fixed += 1;
+      waiting = false;
+    }
   }
-  if (rules.linkByBranch && wt.branch) {
-    const byBranch = sameRepo.find((p) => p.headRefName === wt.branch);
-    if (byBranch && !bindings[byBranch.key]) return byBranch;
+}
+function todayFlow(prs, rules, now) {
+  const start = dayStart(now, rules.dayCutoff);
+  const s = { opened: 0, drafts: 0, first: 0, re: 0, changes: 0, approve: 0, fixed: 0, merged: 0, closed: 0, byRepo: {} };
+  for (const pr of prs) flowForPr(pr, rules, start, s);
+  return s;
+}
+function isAuthorFix(e, rules) {
+  if (e.type === "commit") return !(rules.ignoreMergeBase && e.merge);
+  if (e.type === "rerequest") return rules.rerequest;
+  if (e.type === "comment" && e.isAuthor) return rules.authorReply;
+  return e.type === "mark" && e.verdict === "fixed";
+}
+function dailySeries(snapshots, repoList, rules, now, days = 14) {
+  const series = repoList.filter((r) => r.enabled).map((r) => ({
+    slug: r.slug,
+    colorIndex: repoList.findIndex((x) => x.slug === r.slug)
+  }));
+  const anchor = new Date(dayStart(now, rules.dayCutoff));
+  const out = [];
+  for (let i = days - 1; i >= 0; i -= 1) {
+    const d = new Date(anchor);
+    d.setDate(d.getDate() - i);
+    const at = d.getTime();
+    const key = dateKey(at);
+    out.push({
+      at,
+      key,
+      vals: series.map((r) => Number(snapshots[r.slug]?.daily?.[key] || 0))
+    });
   }
+  return { series, days: out };
+}
+function selectRows(prs, { rules, meSet, repoFilter = "all", reposEnabled = {}, showIgnored = false, wts = [], bindings = {}, reviewingSince = {}, now }) {
+  return prs.filter((pr) => reposEnabled[pr.repoSlug] !== false).filter(
+    (pr) => repoFilter === "all" ? true : Array.isArray(repoFilter) ? repoFilter.includes(pr.repoSlug) : pr.repoSlug === repoFilter
+  ).filter((pr) => isTracked(pr, rules, meSet)).filter((pr) => showIgnored || !pr.ignored).map((pr) => {
+    const hasWorktree = wts.some(
+      (wt) => !wt.auto && linkPr(wt, { prs, bindings, rules })?.key === pr.key
+    );
+    const d = reviewingState(derive(pr, rules), hasWorktree, reviewingSince[pr.key]);
+    return { pr, d, f: flags(d, rules, now) };
+  }).filter(({ d }) => rules.includeDraft || d.key !== "draft");
+}
+function flowByDay(prs, rules, now, days = 14) {
+  const anchor = new Date(dayStart(now, rules.dayCutoff));
+  const keys = [];
+  for (let i = days - 1; i >= 0; i -= 1) {
+    const d = new Date(anchor);
+    d.setDate(d.getDate() - i);
+    keys.push(dateKey(d.getTime()));
+  }
+  const map = Object.fromEntries(keys.map((k) => [k, { reviews: 0, fixed: 0, merged: 0 }]));
+  for (const pr of prs) {
+    let waiting = false;
+    for (const e of pr.events || []) {
+      const key = dateKey(dayStart(e.at, rules.dayCutoff));
+      const bucket = map[key];
+      if (e.type === "mark" && e.verdict === "reset") {
+        waiting = false;
+        continue;
+      }
+      const verdict = verdictOf(e, rules);
+      if (verdict) {
+        if (bucket) bucket.reviews += 1;
+        waiting = verdict === "changes";
+        continue;
+      }
+      if (waiting && isAuthorFix(e, rules)) {
+        if (bucket) bucket.fixed += 1;
+        waiting = false;
+        continue;
+      }
+      if (e.type === "merged" && bucket) bucket.merged += 1;
+    }
+  }
+  return keys.map((key) => ({ key, ...map[key] }));
+}
+
+// src/rows.js
+function decoratedPrs(state, allPrs) {
+  const repoIndexMap = new Map(state.cfg.repos.map((r, i) => [r.slug, i]));
+  const ignored = new Set(state.local.ignored);
+  return allPrs.map((pr) => ({
+    ...pr,
+    ignored: ignored.has(pr.key),
+    repoIndex: repoIndexMap.get(pr.repoSlug) ?? 0
+  }));
+}
+function meSetOf(state) {
+  return new Set(
+    [state.runtime.ghLogin, ...state.cfg.extraAccounts].filter(Boolean).map((v) => String(v).toLowerCase())
+  );
+}
+function reposEnabledOf(state) {
+  const out = {};
+  for (const repo of state.cfg.repos) out[repo.slug] = repo.enabled && repo.available !== false;
+  return out;
+}
+function worktreesOf(store, index) {
+  return autoFlags(index.getSnapshot().worktrees, store.getSnapshot().auto);
+}
+function trackedRows(store, index, now = Date.now()) {
+  const state = store.getSnapshot();
+  const prs = decoratedPrs(state, store.allPrs());
+  const wts = worktreesOf(store, index);
+  return {
+    prs,
+    wts,
+    rows: selectRows(prs, {
+      rules: state.cfg.rules,
+      meSet: meSetOf(state),
+      reposEnabled: reposEnabledOf(state),
+      wts,
+      bindings: state.local.bindings,
+      reviewingSince: state.local.reviewing,
+      now
+    })
+  };
+}
+
+// src/automation/cleanup.js
+function createCleanup({ ctx, store, index, exec, now, isDisposed }) {
+  function cleanable() {
+    return cleanableAuto({ wts: worktreesOf(store, index), records: store.getSnapshot().auto, prs: store.allPrs() });
+  }
+  const stillCleanable = (item) => cleanable().some((c) => c.prKey === item.prKey && c.wt.path === item.wt.path);
+  async function removeOne(item) {
+    const repo = index.getSnapshot().repos.find((r) => r.slug === item.wt.repo);
+    if (!repo || !stillCleanable(item)) return "skipped";
+    if (await exec.isDirty(item.wt.path)) return "dirty";
+    try {
+      await ctx.worktrees.remove({ repoPath: repo.path, worktreePath: item.wt.path, branch: item.wt.branch, deleteBranch: false });
+    } catch {
+      return "failed";
+    }
+    if (isDisposed()) return "removed";
+    const record = store.getSnapshot().auto[item.prKey];
+    if (record) store.setAutoRecord(item.prKey, { ...record, status: "removed", at: now() });
+    store.unbind(item.prKey);
+    store.clearReviewing(item.prKey);
+    return "removed";
+  }
+  async function cleanup(items) {
+    const out = { removed: 0, dirty: 0, failed: 0, skipped: 0 };
+    for (const item of items) {
+      if (isDisposed()) break;
+      out[await removeOne(item)] += 1;
+    }
+    if (out.removed && !isDisposed()) await index.refresh();
+    return out;
+  }
+  return { cleanable, cleanup, isDirty: (path) => exec.isDirty(path) };
+}
+
+// src/automation/autoWorktree.js
+var RECORD_TTL_MS = 30 * DAY;
+function freshRecord(prev, { branch, repo, now }) {
+  return {
+    status: "creating",
+    attempts: (prev?.attempts || 0) + 1,
+    at: now,
+    branch,
+    repo: repo.slug,
+    parentId: repo.workspaceId,
+    workspaceId: "",
+    path: "",
+    missingSince: 0,
+    lastError: prev?.lastError || ""
+  };
+}
+function bindNewlyResolved(store, before, after) {
+  const bindings = store.getSnapshot().local.bindings;
+  const taken = new Set(Object.values(bindings));
+  for (const [key, next] of Object.entries(after)) {
+    const prev = before[key];
+    if (next.status !== "created" || !next.workspaceId || prev?.workspaceId === next.workspaceId) continue;
+    if (bindings[key] || taken.has(next.workspaceId)) continue;
+    store.bind(key, next.workspaceId);
+    taken.add(next.workspaceId);
+  }
+}
+function createReconciler({ store, index, now, inFlight }) {
+  return function reconcile() {
+    const snap = index.getSnapshot();
+    if (snap.loading || snap.error) return;
+    const before = store.getSnapshot().auto;
+    const step = reconcileRecords({
+      records: before,
+      wts: snap.worktrees,
+      repoSlugs: new Set(snap.repos.map((r) => r.slug)),
+      parentIds: new Set(snap.repos.map((r) => r.workspaceId)),
+      inFlight,
+      now: now()
+    });
+    const live = new Set(store.allPrs().map((p) => p.key));
+    const pruned = pruneRecords(step.records, live, now(), RECORD_TTL_MS);
+    if (!step.changed && !pruned.changed) return;
+    store.setAutoRecords(pruned.records);
+    bindNewlyResolved(store, before, pruned.records);
+  };
+}
+function createCreator({ ctx, store, index, now, newBranch, reconcile, isDisposed }) {
+  async function attemptCreate(pr, repo, prev, branch) {
+    const record = freshRecord(prev, { branch, repo, now: now() });
+    store.setAutoRecord(pr.key, record);
+    try {
+      const result = await ctx.worktrees.create({
+        repoPath: repo.path,
+        parentWorkspaceId: repo.workspaceId,
+        branch,
+        prNumber: pr.number,
+        prTitle: pr.title,
+        prUrl: pr.url
+      });
+      if (isDisposed()) return { ok: true, record };
+      store.setAutoRecord(pr.key, { ...record, status: "created", at: now(), path: result.worktreePath, lastError: "" });
+      await index.refresh();
+      if (!isDisposed()) reconcile();
+      return { ok: true, record };
+    } catch (error) {
+      return { ok: false, record, message: error?.message || String(error) };
+    }
+  }
+  return async function createOne(pr) {
+    const repo = index.getSnapshot().repos.find((r) => r.slug === pr.repoSlug);
+    if (!repo) return "skip";
+    let prev = store.getSnapshot().auto[pr.key];
+    for (let renamed = 0; renamed < 2; renamed += 1) {
+      const outcome = await attemptCreate(pr, repo, prev, newBranch(pr));
+      if (outcome.ok) return "created";
+      if (isDisposed()) return "skip";
+      const { action } = classifyCreateError(outcome.message);
+      if (action === "rename" && renamed === 0) {
+        prev = outcome.record;
+        continue;
+      }
+      store.setAutoRecord(pr.key, recordAfterFailure(outcome.record, outcome.message, now()));
+      return action === "retry" ? "transient" : "failed";
+    }
+    return "failed";
+  };
+}
+function plan(store, index, now, perRun) {
+  const state = store.getSnapshot();
+  const snap = index.getSnapshot();
+  const { rows, prs, wts } = trackedRows(store, index, now());
+  return pickAutoCandidates({
+    rows,
+    wts,
+    prs,
+    bindings: state.local.bindings,
+    rules: state.cfg.rules,
+    records: state.auto,
+    repoSlugs: new Set(snap.repos.map((r) => r.slug)),
+    skipSlugs: new Set(Object.keys(state.runtime.errors || {})),
+    meSet: meSetOf(state),
+    includeForks: state.cfg.automation.autoWorktreeForks,
+    max: state.cfg.automation.autoWorktreeMax,
+    now: now(),
+    ...perRun ? { perRun } : {}
+  });
+}
+function blockedReason(store, index) {
+  const state = store.getSnapshot();
+  const snap = index.getSnapshot();
+  if (!state.ready || !state.cfg.automation.autoWorktree) return "disabled";
+  if (!state.runtime.ghLogin || state.runtime.ghError) return "noLogin";
+  if (snap.loading || snap.error || snap.repos.length === 0) return "indexNotReady";
   return null;
 }
-function wtFor(pr, { wts, prs, bindings, rules }) {
-  const boundId = bindings[pr.key];
-  if (boundId) return wts.find((w) => w.workspaceId === boundId) || null;
-  return wts.find((w) => linkPr(w, { prs, bindings, rules })?.key === pr.key) || null;
+function stillNeeded(store, index, pr) {
+  const state = store.getSnapshot();
+  return !hasAnyWorktree(pr, {
+    wts: worktreesOf(store, index),
+    prs: store.allPrs(),
+    bindings: state.local.bindings,
+    rules: state.cfg.rules
+  });
 }
-function linkSource(wt, pr, bindings) {
-  if (bindings[pr.key] === wt.workspaceId) return "\u4F60\u624B\u52A8\u7ED1\u5B9A";
-  if (wt.prNumber === pr.number) return "\u5BA2\u6237\u7AEF\u4ECE PR \u521B\u5EFA";
-  return "\u5206\u652F\u540D\u4E0E PR \u4E00\u81F4";
-}
-function bindCandidates(pr, { wts, prs, bindings, rules }) {
-  return wts.filter((w) => w.repo === pr.repoSlug && !w.creating).map((wt) => {
-    const current = linkPr(wt, { prs, bindings, rules });
-    const manual = Object.values(bindings).includes(wt.workspaceId);
-    if (current && current.key === pr.key) {
-      return { wt, state: "current", text: "\u5F53\u524D\u5DF2\u5BF9\u5E94\u8FD9\u4E2A PR", disabled: true };
+function createBreaker({ store, now }) {
+  let until = 0;
+  let tripped = false;
+  const publish = () => store.setRuntime({ autoBreaker: tripped ? { until } : null });
+  return {
+    isTripped: () => tripped,
+    blocked: () => tripped && now() < until,
+    until: () => until,
+    trip: () => {
+      tripped = true;
+      until = now() + AUTO_WT_RETRY_MS;
+      publish();
+    },
+    reset: () => {
+      if (!tripped) return;
+      tripped = false;
+      until = 0;
+      publish();
     }
-    if (wt.prNumber != null && !manual) {
-      return { wt, state: "host", text: `\u5BA2\u6237\u7AEF\u4ECE #${wt.prNumber} \u521B\u5EFA`, disabled: true };
-    }
-    if (current) {
-      return { wt, state: "taken", text: `\u5DF2\u5BF9\u5E94 #${current.number}\uFF0C\u6539\u7ED1\u540E\u89E3\u9664`, disabled: false };
-    }
-    return { wt, state: "free", text: "\u7A7A\u95F2", disabled: false };
-  }).sort((a, b) => PICK_ORDER[a.state] - PICK_ORDER[b.state]);
+  };
 }
-function newBranchName(pr, random = Math.random) {
-  const suffix = String(Math.floor(random() * 1e3)).padStart(3, "0");
-  return `pr-${pr.number}-${suffix}`;
+function createAutoWorktree({ ctx, store, index, exec, now = Date.now, newBranch = newBranchName }) {
+  const inFlight = /* @__PURE__ */ new Set();
+  let running = null;
+  let disposed = false;
+  const isDisposed = () => disposed;
+  const reconcile = createReconciler({ store, index, now, inFlight });
+  const createOne = createCreator({ ctx, store, index, now, newBranch, reconcile, isDisposed });
+  const breaker = createBreaker({ store, now });
+  const cleanup = createCleanup({ ctx, store, index, exec, now, isDisposed });
+  const claim = (prKey) => {
+    if (inFlight.has(prKey)) return false;
+    inFlight.add(prKey);
+    return true;
+  };
+  const release = (prKey) => {
+    inFlight.delete(prKey);
+  };
+  async function createPicked(picks, onProgress) {
+    let created = 0;
+    let failed = 0;
+    let transient = 0;
+    let done = 0;
+    const report = () => onProgress?.({ done, total: picks.length });
+    report();
+    for (const pr of picks) {
+      if (disposed || !store.getSnapshot().cfg.automation.autoWorktree) break;
+      if (!stillNeeded(store, index, pr) || !claim(pr.key)) continue;
+      let outcome;
+      try {
+        outcome = await createOne(pr);
+      } finally {
+        release(pr.key);
+      }
+      if (outcome === "created") {
+        created += 1;
+        breaker.reset();
+      } else if (outcome === "transient" || outcome === "failed") {
+        failed += 1;
+      }
+      done += 1;
+      report();
+      transient = outcome === "transient" ? transient + 1 : 0;
+      if (transient && (breaker.isTripped() || transient >= AUTO_WT_BREAKER)) {
+        breaker.trip();
+        break;
+      }
+    }
+    return { created, failed };
+  }
+  function perRunFor(manual) {
+    if (breaker.isTripped()) return 1;
+    return manual ? Infinity : 0;
+  }
+  async function runOnce({ manual, onProgress }) {
+    reconcile();
+    const blocked = disposed ? "disabled" : blockedReason(store, index);
+    if (blocked) return { created: 0, failed: 0, reason: blocked };
+    if (breaker.blocked()) return { created: 0, failed: 0, reason: "breaker", until: breaker.until() };
+    const picked = plan(store, index, now, perRunFor(manual));
+    if (!picked.picks.length) return { created: 0, failed: 0, reason: picked.capped ? "capped" : "none", plan: picked };
+    const { created, failed } = await createPicked(picked.picks, onProgress);
+    return { created, failed, manual, reason: created ? "created" : "failed", plan: picked };
+  }
+  function run({ manual = false, onProgress } = {}) {
+    if (running && !manual) return running;
+    const previous = running;
+    const current = (async () => {
+      if (previous) await previous.catch(() => void 0);
+      return runOnce({ manual, onProgress });
+    })();
+    running = current;
+    current.finally(() => {
+      if (running === current) running = null;
+    }).catch(() => void 0);
+    return current;
+  }
+  function status() {
+    const { autoWorktree: enabled, autoWorktreeMax: max } = store.getSnapshot().cfg.automation;
+    const { alive, capped, waiting, total, eligible: eligible2, skipped } = plan(store, index, now, 0);
+    return {
+      enabled,
+      max,
+      alive,
+      total,
+      eligible: eligible2,
+      skipped,
+      capped: enabled && capped,
+      waiting,
+      breaker: enabled && breaker.isTripped()
+    };
+  }
+  function adopt(prKey) {
+    const record = store.getSnapshot().auto[prKey];
+    if (!record || record.status !== "created") return;
+    store.setAutoRecord(prKey, { ...record, status: "adopted", at: now() });
+    store.markReviewing(prKey, now());
+  }
+  function adoptWorktree(workspaceId) {
+    const hit = Object.entries(store.getSnapshot().auto).find(
+      ([, r]) => r.status === "created" && r.workspaceId === workspaceId
+    );
+    if (hit) store.setAutoRecord(hit[0], { ...hit[1], status: "adopted", at: now() });
+  }
+  function resetFailures() {
+    const records = store.getSnapshot().auto;
+    const keep = Object.fromEntries(
+      Object.entries(records).filter(([, r]) => r.status !== "failed" && r.status !== "gave_up")
+    );
+    const cleared = Object.keys(records).length - Object.keys(keep).length;
+    if (cleared) store.setAutoRecords(keep);
+    breaker.reset();
+    return cleared;
+  }
+  return {
+    run,
+    reconcile,
+    claim,
+    release,
+    isBusy: (prKey) => inFlight.has(prKey),
+    status,
+    adopt,
+    adoptWorktree,
+    resetFailures,
+    ...cleanup,
+    dispose: () => {
+      disposed = true;
+    }
+  };
 }
-function reviewingState(d, hasWorktree, since) {
-  if (!hasWorktree || d.key !== "needs_review") return d;
-  return { ...d, key: "reviewing", since: since || d.since };
+
+// src/i18n.js
+function isEnglish(locale) {
+  return !/^zh/i.test(String(locale || ""));
+}
+function createT(locale) {
+  const en = isEnglish(locale);
+  return (zh, enText) => en ? enText ?? zh : zh;
+}
+var DEFAULT_DEFS_EN = {
+  needs_review: { label: "New", tone: "blue", owner: "me", badge: true },
+  reviewing: { label: "Rev", tone: "cyan", owner: "me", badge: true },
+  changes_requested: { label: "Chg", tone: "yellow", owner: "author", badge: true },
+  needs_rereview: { label: "Re", tone: "rose", owner: "me", badge: true },
+  approved: { label: "OK", tone: "green", owner: "merge", badge: true },
+  draft: { label: "Draft", tone: "neutral", owner: "author", badge: false },
+  merged: { label: "Merge", tone: "purple", owner: "done", badge: true },
+  closed: { label: "Closed", tone: "neutral", owner: "done", badge: true },
+  done: { label: "Done", tone: "lime", owner: "done", badge: true }
+};
+var OWNER_LABELS_EN = { me: "You", author: "Author", merge: "Merge", done: "Done" };
+function ownerLabel(owner, t) {
+  return t(
+    { me: "\u7B49\u6211", author: "\u7B49\u4F5C\u8005", merge: "\u7B49\u5408\u5E76", done: "\u5DF2\u7ED3\u675F" }[owner] || owner,
+    OWNER_LABELS_EN[owner] || owner
+  );
+}
+
+// src/domain/digest.js
+var pad2 = (n) => String(n).padStart(2, "0");
+var ENDED = /* @__PURE__ */ new Set(["merged", "closed"]);
+var GITHUB_PR = /^https:\/\/github\.com\/[^\s]+$/;
+var UNSAFE_CHARS = /[\u0000-\u001f\u007f\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
+function cleanTitle(raw) {
+  return [...String(raw || "").replace(UNSAFE_CHARS, " ")].slice(0, 60).join("");
+}
+function errorCategory(message) {
+  const text2 = String(message || "");
+  const cut = text2.search(/[：:]/);
+  const head = cut > 0 ? text2.slice(0, cut) : text2;
+  return [...head].slice(0, 40).join("");
+}
+function slotKey(ms) {
+  const d = new Date(ms);
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}T${pad2(d.getHours())}`;
+}
+function isQuietHour(ms, cfg) {
+  if (!cfg?.quiet || cfg.quietStart === cfg.quietEnd) return false;
+  const hour = new Date(ms).getHours();
+  return cfg.quietStart > cfg.quietEnd ? hour >= cfg.quietStart || hour < cfg.quietEnd : hour >= cfg.quietStart && hour < cfg.quietEnd;
+}
+var liveRepos = (repos) => repos.filter((r) => r.enabled !== false && r.available !== false);
+function digestSnapshot(rows, repos) {
+  const out = Object.fromEntries(liveRepos(repos).map((r) => [r.slug, {}]));
+  for (const { pr, d } of rows) {
+    const bucket = out[pr.repoSlug];
+    if (!bucket || pr.ignored) continue;
+    bucket[pr.key] = {
+      s: d.key,
+      n: pr.number,
+      t: cleanTitle(pr.title),
+      u: GITHUB_PR.test(pr.url || "") ? pr.url : ""
+    };
+  }
+  return out;
+}
+function sameErrors(a, b) {
+  const ka = Object.keys(a || {});
+  const kb = Object.keys(b || {});
+  return ka.length === kb.length && ka.every((k) => a[k] === b[k]);
+}
+var changeOrder = (a, b) => a.kind === b.kind ? b.n - a.n : a.kind === "new" ? -1 : 1;
+function repoChanges(before, now) {
+  const list = [];
+  for (const [key, cur] of Object.entries(now)) {
+    const prev = before[key];
+    if (!prev) list.push({ key, ...cur, kind: "new", from: null, to: cur.s });
+    else if (prev.s !== cur.s) list.push({ key, ...cur, kind: "status", from: prev.s, to: cur.s });
+  }
+  return list.sort(changeOrder);
+}
+function diffDigest(baseline, current, errors) {
+  if (!baseline) return { initial: true, hasChanges: true, changes: {}, newRepos: [], errorChanged: false };
+  const changes = {};
+  const newRepos = [];
+  for (const [slug, prs] of Object.entries(current)) {
+    const before = baseline.repos?.[slug];
+    if (!before) {
+      newRepos.push(slug);
+      continue;
+    }
+    const list = repoChanges(before, prs);
+    if (list.length) changes[slug] = list;
+  }
+  const errorChanged = !sameErrors(baseline.errors, errors);
+  const hasChanges = Object.keys(changes).length > 0 || newRepos.length > 0 || errorChanged;
+  return { initial: false, hasChanges, changes, newRepos, errorChanged };
+}
+var text = (value) => ({ tag: "text", text: value });
+function statusLine(prs, defs) {
+  const counts2 = {};
+  for (const item of Object.values(prs)) {
+    if (!ENDED.has(item.s)) counts2[item.s] = (counts2[item.s] || 0) + 1;
+  }
+  return STATUS_ORDER.filter((key) => counts2[key]).map((key) => `${defs[key]?.label || key} ${counts2[key]}`).join(" \xB7 ");
+}
+var openCount = (prs) => Object.values(prs).filter((item) => !ENDED.has(item.s)).length;
+function changeText(change, defs, t) {
+  const label = (key) => defs[key]?.label || key;
+  if (change.kind === "new") return `\uFF1A${t("\u65B0\u589E", "new")} \xB7 ${label(change.to)}`;
+  if (ENDED.has(change.to)) return `\uFF1A${label(change.to)}`;
+  return `\uFF1A${label(change.from)} \u2192 ${label(change.to)}`;
+}
+function changeLine(change, defs, t) {
+  const title = `#${change.n} ${change.t}`;
+  const head = change.u ? { tag: "a", text: title, href: change.u } : text(title);
+  return [text("\xB7 "), head, text(changeText(change, defs, t))];
+}
+function repoBlock({ slug, prs, diff, errors, defs, t, perRepo }) {
+  const lines2 = [[text(`\u25A0 ${slug} \xB7 ${t("\u672A\u5408\u5E76", "open")} ${openCount(prs)}`)]];
+  const dist = statusLine(prs, defs);
+  if (dist) lines2.push([text(dist)]);
+  if (errors[slug]) lines2.push([text(`${t("\u540C\u6B65\u5931\u8D25", "Sync failed")}\uFF1A${errorCategory(errors[slug])}`)]);
+  if (diff.newRepos.includes(slug)) lines2.push([text(t("\u5F00\u59CB\u8DDF\u8E2A\u8FD9\u4E2A\u4ED3\u5E93", "Now tracking this repository"))]);
+  const changes = diff.changes[slug] || [];
+  for (const change of changes.slice(0, perRepo)) lines2.push(changeLine(change, defs, t));
+  const rest = changes.length - Math.min(perRepo, changes.length);
+  if (rest > 0) lines2.push([text(t(`\u2026\u8FD8\u6709 ${rest} \u6761\u53D8\u5316`, `\u2026${rest} more changes`))]);
+  return lines2;
+}
+function overview(current, defs, t) {
+  const open = Object.values(current).flatMap((prs) => Object.values(prs)).filter((item) => !ENDED.has(item.s));
+  const by = (owner) => open.filter((item) => defs[item.s]?.owner === owner).length;
+  const [me, author, merge] = [by("me"), by("author"), by("merge")];
+  return t(
+    `\u7B49\u6211\u5904\u7406 ${me} \xB7 \u7B49\u4F5C\u8005 ${author} \xB7 \u7B49\u5408\u5E76 ${merge} \xB7 \u672A\u5408\u5E76\u5171 ${open.length}`,
+    `On me ${me} \xB7 on author ${author} \xB7 to merge ${merge} \xB7 open ${open.length}`
+  );
+}
+function buildDigestPost({ current, diff, errors, defs, repos, now, t, locale, perRepo = DIGEST_CHANGES_PER_REPO, maxRepos = Infinity, test = false }) {
+  const d = new Date(now);
+  const hhmm = `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+  const suffix = test ? t("\uFF08\u6D4B\u8BD5\uFF09", " (test)") : diff.initial ? t("\uFF08\u9996\u6B21\uFF09", " (first)") : "";
+  const title = `${t("Git \u4EFB\u52A1\u6C47\u603B", "Git tasks digest")} \xB7 ${hhmm}${suffix}`;
+  const content = [[text(overview(current, defs, t))]];
+  const global = errors["*"];
+  if (global) content.push([text(`${t("\u540C\u6B65\u5931\u8D25", "Sync failed")}\uFF1A${errorCategory(global)}`)]);
+  const shown = liveRepos(repos).filter((repo) => current[repo.slug]);
+  for (const repo of shown.slice(0, maxRepos)) {
+    content.push(...repoBlock({ slug: repo.slug, prs: current[repo.slug], diff, errors, defs, t, perRepo }));
+  }
+  const hidden = shown.length - Math.min(maxRepos, shown.length);
+  if (hidden > 0) content.push([text(t(`\u2026\u8FD8\u6709 ${hidden} \u4E2A\u4ED3\u5E93`, `\u2026${hidden} more repositories`))]);
+  const lang = isEnglish(locale) ? "en_us" : "zh_cn";
+  return { msg_type: "post", content: { post: { [lang]: { title, content } } } };
+}
+function postToText(post) {
+  const body = Object.values(post.content.post)[0];
+  const line = (para) => para.map((el) => el.tag === "a" ? `${el.text} ${el.href}` : el.text).join("");
+  return { msg_type: "text", content: { text: [body.title, ...body.content.map(line)].join("\n") } };
+}
+function postBytes(post) {
+  return new TextEncoder().encode(JSON.stringify(post)).length;
+}
+function fitDigestPost(args, maxBytes = FEISHU_MAX_BYTES) {
+  for (const perRepo of [DIGEST_CHANGES_PER_REPO, 8, 4, 2, 0]) {
+    const post2 = buildDigestPost({ ...args, perRepo });
+    if (postBytes(post2) <= maxBytes) return post2;
+  }
+  let maxRepos = Object.keys(args.current).length;
+  let post = buildDigestPost({ ...args, perRepo: 0, maxRepos });
+  while (maxRepos > 1 && postBytes(post) > maxBytes) {
+    maxRepos = Math.floor(maxRepos / 2);
+    post = buildDigestPost({ ...args, perRepo: 0, maxRepos });
+  }
+  return post;
+}
+
+// src/notify/feishu.js
+var WEBHOOK = /^https:\/\/open\.feishu\.cn\/open-apis\/bot\/v2\/hook\/([A-Za-z0-9-]{8,128})$/;
+var SECRET = /^[\x21-\x7e]{1,128}$/;
+var RETRY_DELAYS = [3e3, 15e3];
+function validateWebhook(raw) {
+  const value = String(raw || "").trim();
+  if (!value) return { ok: false, value, message: "empty" };
+  if (!WEBHOOK.test(value)) return { ok: false, value, message: "format" };
+  return { ok: true, value };
+}
+function validateSecret(raw) {
+  const value = String(raw || "").trim();
+  if (!value) return { ok: true, value };
+  return SECRET.test(value) ? { ok: true, value } : { ok: false, value, message: "format" };
+}
+function maskWebhook(raw) {
+  const value = String(raw || "").trim();
+  if (!value) return "";
+  const token = WEBHOOK.exec(value)?.[1];
+  if (!token) return "\u2026";
+  return `https://open.feishu.cn/\u2026/hook/${token.slice(0, 4)}\u2026${token.slice(-4)}`;
+}
+function toBase64(bytes) {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+async function signFeishu(secret, timestampSec) {
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(`${timestampSec}
+${secret}`),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const signature = await crypto.subtle.sign("HMAC", key, new Uint8Array(0));
+  return toBase64(new Uint8Array(signature));
+}
+var redact = (text2) => String(text2 || "").replace(/hook\/[A-Za-z0-9-]+/g, "hook/***").slice(0, 300);
+var FATAL_CODES = { 19021: "sign", 19022: "ip", 19024: "keyword", 19002: "format", 9499: "format" };
+function classifyBody(body) {
+  let data;
+  try {
+    data = JSON.parse(body || "");
+  } catch {
+    return { kind: "server", retry: true, message: redact(body) };
+  }
+  const code = Number(data?.code ?? data?.StatusCode);
+  const message = redact(data?.msg ?? data?.StatusMessage ?? "");
+  if (code === 0) return { kind: "ok" };
+  if (code === 11232) return { kind: "rate", retry: true, code, message };
+  if (FATAL_CODES[code]) return { kind: FATAL_CODES[code], fatal: true, code, message };
+  return { kind: "rejected", fatal: true, code, message };
+}
+function classifyFeishuResult(response, error) {
+  if (error) {
+    const message = redact(error?.message || error);
+    if (/grant|permission|not allowed/i.test(message)) return { kind: "permission", fatal: true, message };
+    return { kind: "network", retry: true, message };
+  }
+  const status = Number(response?.status) || 0;
+  if (status === 429) return { kind: "rate", retry: true, message: "HTTP 429" };
+  if (status >= 500 || status === 0) return { kind: "server", retry: true, message: `HTTP ${status}` };
+  if (status >= 400) return { kind: "http", fatal: true, message: `HTTP ${status}` };
+  return classifyBody(response?.body);
+}
+function describeFeishuFailure(result, t) {
+  const detail = result?.message ? `\uFF08${redact(result.message)}\uFF09` : "";
+  switch (result?.kind) {
+    case "invalid":
+      return t("\u98DE\u4E66 webhook \u5730\u5740\u4E0D\u6B63\u786E\uFF0C\u8BF7\u5728\u8BBE\u7F6E\u91CC\u91CD\u65B0\u586B\u5199", "Invalid Feishu webhook URL");
+    case "sign":
+      return t(
+        `\u98DE\u4E66\u7B7E\u540D\u6821\u9A8C\u5931\u8D25\uFF1A\u7B7E\u540D\u5BC6\u94A5\u4E0D\u5BF9\uFF0C\u6216\u672C\u673A\u65F6\u95F4\u4E0E\u6807\u51C6\u65F6\u95F4\u76F8\u5DEE\u8D85\u8FC7 1 \u5C0F\u65F6${detail}`,
+        `Feishu signature rejected: wrong secret or clock off by more than 1 hour${detail}`
+      );
+    case "keyword":
+      return t(
+        `\u98DE\u4E66\u673A\u5668\u4EBA\u5F00\u542F\u4E86\u300C\u81EA\u5B9A\u4E49\u5173\u952E\u8BCD\u300D\uFF0C\u6D88\u606F\u91CC\u6CA1\u6709\u547D\u4E2D\u5173\u952E\u8BCD\uFF1B\u53EF\u52A0\u5165\u5173\u952E\u8BCD\u201CGit \u4EFB\u52A1\u6C47\u603B\u201D${detail}`,
+        `The bot requires keywords; add "Git tasks digest" as a keyword${detail}`
+      );
+    case "ip":
+      return t(`\u98DE\u4E66\u673A\u5668\u4EBA\u5F00\u542F\u4E86 IP \u767D\u540D\u5355\uFF0C\u672C\u673A IP \u4E0D\u5728\u540D\u5355\u5185${detail}`, `This machine's IP is not whitelisted${detail}`);
+    case "permission":
+      return t(`\u63D2\u4EF6\u7F3A\u5C11\u8BBF\u95EE open.feishu.cn \u7684\u6388\u6743${detail}`, `Missing network grant for open.feishu.cn${detail}`);
+    case "format":
+      return t(
+        `\u98DE\u4E66\u4E0D\u63A5\u53D7\u8FD9\u6761\u6D88\u606F\u7684\u683C\u5F0F\uFF08\u63D2\u4EF6\u7684\u95EE\u9898\uFF0C\u8BF7\u53CD\u9988\u7ED9\u63D2\u4EF6\u4F5C\u8005\uFF09${detail}`,
+        `Feishu rejected the message format (a plugin bug; please report it)${detail}`
+      );
+    case "rate":
+      return t(`\u98DE\u4E66\u9650\u6D41\uFF0C\u7A0D\u540E\u81EA\u52A8\u91CD\u8BD5${detail}`, `Rate limited by Feishu${detail}`);
+    case "network":
+    case "server":
+      return t(`\u8FDE\u63A5\u98DE\u4E66\u5931\u8D25\uFF0C\u4E0B\u4E2A\u6574\u70B9\u4F1A\u518D\u8BD5${detail}`, `Could not reach Feishu; will retry next hour${detail}`);
+    default:
+      return t(`\u98DE\u4E66\u62D2\u7EDD\u4E86\u8FD9\u6761\u6D88\u606F${detail}`, `Feishu rejected the message${detail}`);
+  }
+}
+async function attempt({ invoke, webhook, secret, payload, now }) {
+  const body = { ...payload };
+  if (secret) {
+    const timestamp = Math.floor(now() / 1e3);
+    body.timestamp = String(timestamp);
+    body.sign = await signFeishu(secret, timestamp);
+  }
+  try {
+    const response = await invoke("plugin_http_request", {
+      method: "POST",
+      url: webhook,
+      headers: { "Content-Type": "application/json; charset=utf-8" },
+      body: JSON.stringify(body)
+    });
+    return classifyFeishuResult(response, null);
+  } catch (error) {
+    return classifyFeishuResult(null, error);
+  }
+}
+async function sendFeishu({
+  invoke,
+  webhook,
+  secret = "",
+  payload,
+  now = Date.now,
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  shouldAbort = () => false
+}) {
+  const hook = validateWebhook(webhook);
+  if (!hook.ok) return { ok: false, kind: "invalid", fatal: true, message: "" };
+  let result = null;
+  for (let i = 0; i <= RETRY_DELAYS.length; i += 1) {
+    if (shouldAbort()) return { ok: false, kind: "aborted", message: "" };
+    result = await attempt({ invoke, webhook: hook.value, secret: String(secret || "").trim(), payload, now });
+    if (result.kind === "ok") return { ok: true };
+    if (!result.retry || i === RETRY_DELAYS.length) break;
+    await sleep(RETRY_DELAYS[i]);
+  }
+  return { ok: false, ...result };
+}
+
+// src/automation/digest.js
+var SLOT_RETRY_MS = 5 * MINUTE;
+var SLOT_RETRIES = 3;
+var FRESH_SYNC_MS = 2 * MINUTE;
+var liveSlugs = (state) => state.cfg.repos.filter((r) => r.enabled !== false && r.available !== false).map((r) => r.slug);
+function currentErrors(state) {
+  const live = new Set(liveSlugs(state));
+  const errors = Object.fromEntries(
+    Object.entries(state.runtime.errors || {}).filter(([slug, msg]) => live.has(slug) && typeof msg === "string").map(([slug, msg]) => [slug, errorCategory(msg)])
+  );
+  if (state.runtime.ghError) errors["*"] = errorCategory(state.runtime.ghError);
+  return errors;
+}
+function allFailed(state, errors) {
+  const live = liveSlugs(state);
+  return !!errors["*"] || live.length > 0 && live.every((slug) => errors[slug]);
+}
+function collect(store, index, now) {
+  const state = store.getSnapshot();
+  const { rows } = trackedRows(store, index, now);
+  return { current: digestSnapshot(rows, state.cfg.repos), errors: currentErrors(state) };
+}
+function createSlotRetry(now) {
+  let retry = null;
+  return {
+    due: (slot) => !!retry && retry.slot === slot && retry.count <= SLOT_RETRIES && now() >= retry.at,
+    exhausted: (slot) => !!retry && retry.slot === slot && retry.count >= SLOT_RETRIES,
+    schedule: (slot) => {
+      const count = retry?.slot === slot ? retry.count + 1 : 1;
+      retry = { slot, count, at: now() + SLOT_RETRY_MS };
+    },
+    clear: () => {
+      retry = null;
+    }
+  };
+}
+function createSender({ ctx, store, t, now, sleep }) {
+  const invoke = (command, args) => ctx.bridge.invoke(command, args);
+  return {
+    build(current, errors, diff, test) {
+      const state = store.getSnapshot();
+      return fitDigestPost({ current, diff, errors, defs: state.cfg.defs, repos: state.cfg.repos, now: now(), t, locale: ctx.host?.locale, test });
+    },
+    async deliver(payload, shouldAbort) {
+      const { webhook, secret } = store.getSnapshot().feishu;
+      const send = (body) => sendFeishu({ invoke, webhook, secret, payload: body, now, shouldAbort, ...sleep ? { sleep } : {} });
+      const result = await send(payload);
+      if (result.ok || result.kind !== "format" || payload.msg_type !== "post" || shouldAbort()) return result;
+      return send(postToText(payload));
+    },
+    recordFailure(result) {
+      const message = describeFeishuFailure(result, t);
+      store.setNotifyState({
+        lastResult: { ok: false, at: now(), message },
+        ...result.fatal ? { paused: { kind: result.kind, message, at: now() } } : {}
+      });
+      return message;
+    }
+  };
+}
+function createDigest({
+  ctx,
+  store,
+  index,
+  sync,
+  t,
+  now = Date.now,
+  sleep,
+  setTimer = (fn, ms) => setInterval(fn, ms),
+  clearTimer = (id) => clearInterval(id)
+}) {
+  let timer = null;
+  let running = null;
+  let disposed = false;
+  let generation = 0;
+  const retry = createSlotRetry(now);
+  const sender = createSender({ ctx, store, t, now, sleep });
+  function configured() {
+    const state = store.getSnapshot();
+    return state.ready && state.cfg.notify.feishu && validateWebhook(state.feishu.webhook).ok;
+  }
+  function due() {
+    const state = store.getSnapshot();
+    if (!configured() || state.notify.paused) return false;
+    const slot = slotKey(now());
+    return slot !== state.notify.lastSlot || retry.due(slot);
+  }
+  async function freshSync() {
+    const last = store.getSnapshot().runtime.lastSync || 0;
+    if (now() - last >= FRESH_SYNC_MS) await sync.run();
+  }
+  async function sendDiff({ current, errors, diff, slot, gen }) {
+    store.setNotifyState({ lastSlot: slotKey(now()) });
+    const stale = () => disposed || gen !== generation || !configured();
+    const result = await sender.deliver(sender.build(current, errors, diff, false), stale);
+    if (stale()) return { skipped: "stale" };
+    if (!result.ok) {
+      if (!result.fatal) retry.schedule(slot);
+      return { failed: sender.recordFailure(result) };
+    }
+    retry.clear();
+    store.setNotifyState({
+      baseline: { repos: current, errors },
+      lastSentAt: now(),
+      lastResult: { ok: true, at: now(), message: "" },
+      paused: null
+    });
+    return { sent: true };
+  }
+  async function runSlot() {
+    const gen = generation;
+    const slot = slotKey(now());
+    store.setNotifyState({ lastSlot: slot });
+    if (isQuietHour(now(), store.getSnapshot().cfg.notify)) return { skipped: "quiet" };
+    await freshSync();
+    if (disposed || gen !== generation || !configured()) return { skipped: "stale" };
+    const { current, errors } = collect(store, index, now());
+    if (allFailed(store.getSnapshot(), errors) && !retry.exhausted(slot)) {
+      retry.schedule(slot);
+      return { skipped: "offline" };
+    }
+    const diff = diffDigest(store.getSnapshot().notify.baseline, current, errors);
+    if (!diff.hasChanges) {
+      retry.clear();
+      return { skipped: "same" };
+    }
+    return sendDiff({ current, errors, diff, slot, gen });
+  }
+  function check() {
+    if (disposed) return Promise.resolve(null);
+    if (running) return running;
+    if (!due()) return Promise.resolve(null);
+    running = runSlot().catch((error) => {
+      store.setNotifyState({ lastResult: { ok: false, at: now(), message: redact(error?.message || error) } });
+      return { failed: true };
+    }).finally(() => {
+      running = null;
+    });
+    return running;
+  }
+  async function sendTest() {
+    try {
+      if (!validateWebhook(store.getSnapshot().feishu.webhook).ok) {
+        return { ok: false, message: describeFeishuFailure({ kind: "invalid" }, t) };
+      }
+      const { current, errors } = collect(store, index, now());
+      const payload = sender.build(current, errors, diffDigest(null, current, errors), true);
+      const result = await sender.deliver(payload, () => disposed);
+      if (!result.ok) return { ok: false, message: sender.recordFailure(result) };
+      store.setNotifyState({ paused: null, lastResult: { ok: true, at: now(), message: "" } });
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, message: redact(error?.message || error) };
+    }
+  }
+  return {
+    check,
+    sendTest,
+    /** 解除暂停并允许本小时立即再发。 */
+    resume: () => {
+      retry.clear();
+      store.setNotifyState({ paused: null, lastSlot: "" });
+    },
+    /** 换了机器人 / 重新开启：新目标当作首次汇总；进行中的发送作废。 */
+    onTargetChanged: () => {
+      generation += 1;
+      retry.clear();
+      store.setNotifyState({ baseline: null, lastSlot: "", paused: null });
+    },
+    start: () => {
+      if (timer || disposed) return;
+      timer = setTimer(() => {
+        void check();
+      }, DIGEST_TICK_MS);
+    },
+    dispose: () => {
+      disposed = true;
+      if (timer) clearTimer(timer);
+      timer = null;
+    }
+  };
 }
 
 // src/domain/text.js
 var zhOnly = (zh) => zh;
-var pad = (n) => String(n).padStart(2, "0");
+var pad3 = (n) => String(n).padStart(2, "0");
 var VERB = ["Approve", "Request changes", "Comment"];
 var VERB_EN = ["approved", "requested changes", "commented"];
 var MARK_EN = {
@@ -395,7 +1584,7 @@ function localMidnight(now) {
 }
 function fmtAbs(ms, now = Date.now(), t = zhOnly) {
   const d = new Date(ms);
-  const hm = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  const hm = `${pad3(d.getHours())}:${pad3(d.getMinutes())}`;
   const today = localMidnight(now);
   if (ms >= today) return `${t("\u4ECA\u5929", "Today")} ${hm}`;
   if (ms >= today - DAY) return `${t("\u6628\u5929", "Yesterday")} ${hm}`;
@@ -733,41 +1922,41 @@ function composeBadgeLabel(label, age) {
   if ([...tight].length <= 6) return tight;
   return [...withDot].slice(0, 6).join("");
 }
-function badgeTip(wt, pr, def, d, rules, bindings, t) {
-  const age = duration(Date.now() - d.since, t);
+function badgeTip(wt, pr, def, d, rules, bindings, t, now) {
+  const age = duration(now - d.since, t);
   return [
     `${pr.repoSlug} #${pr.number} \xB7 ${def.label}${d.reviews ? ` \xB7 ${t(`\u5DF2\u5BA1 ${d.reviews} \u6B21`, `reviewed ${d.reviews}\xD7`)}` : ""}`,
-    nextStep(pr, d, rules, Date.now(), t).plain,
+    nextStep(pr, d, rules, now, t).plain,
     t(`\u505C\u7559 ${age} \xB7 \u5BF9\u5E94\u65B9\u5F0F\uFF1A${linkSource(wt, pr, bindings)}`, `for ${age} \xB7 linked by: ${linkSource(wt, pr, bindings)}`),
     rules.badgeClick === "detail" ? t("\u70B9\u51FB\u67E5\u770B\u6D41\u8F6C\u8BE6\u60C5", "click to open details") : t("\u70B9\u51FB\u5728 GitHub \u6253\u5F00", "click to open on GitHub")
   ].join("\n");
 }
-function badgeForWorktree({ state, wt, pr, t }) {
+function badgeForWorktree({ state, wt, pr, t, now = Date.now() }) {
   const rules = state.cfg.rules;
   if (!rules.badgeEnabled || !pr || pr.ignored) return null;
   const repo = state.cfg.repos.find((r) => r.slug === pr.repoSlug);
   if (!repo || repo.enabled === false) return null;
-  const d = reviewingState(derive(pr, rules), true, state.local.reviewing[pr.key]);
+  const d = reviewingState(derive(pr, rules), !wt.auto, state.local.reviewing[pr.key]);
   const def = state.cfg.defs[d.key];
   if (!def?.badge) return null;
-  const f = flags(d, rules, Date.now());
+  const f = flags(d, rules, now);
   const showAge = rules.badgeAge === "always" || rules.badgeAge === "overdue" && (f.overdue || f.silent);
-  const age = duration(Date.now() - d.since, t);
-  const label = showAge && def.owner !== "done" ? composeBadgeLabel(def.label, compactAge(Date.now() - d.since)) : def.label;
+  const label = showAge && def.owner !== "done" ? composeBadgeLabel(def.label, compactAge(now - d.since)) : def.label;
   return {
     label,
     tone: def.tone,
-    tooltip: badgeTip(wt, pr, def, d, rules, state.local.bindings, t)
+    tooltip: badgeTip(wt, pr, def, d, rules, state.local.bindings, t, now)
   };
 }
-function buildPayload({ state, worktrees, prs, t }) {
+function buildPayload({ state, worktrees, prs, t, now }) {
   return worktrees.map((wt) => [
     wt.workspaceId,
     badgeForWorktree({
       state,
       wt,
       pr: linkPr(wt, { prs, bindings: state.local.bindings, rules: state.cfg.rules }),
-      t
+      t,
+      now
     })
   ]);
 }
@@ -787,7 +1976,7 @@ function openWorktreePr({ ctx, store, index, exec, target }) {
   } catch {
   }
 }
-function createBadges({ ctx, store, index, exec, t }) {
+function createBadges({ ctx, store, index, exec, t, now = Date.now }) {
   const supported = typeof ctx.ui.registerWorktreeBadges === "function";
   let handle = null;
   let known = /* @__PURE__ */ new Set();
@@ -810,17 +1999,18 @@ function createBadges({ ctx, store, index, exec, t }) {
     const state = store.getSnapshot();
     const ignored = new Set(state.local.ignored);
     const prs = store.allPrs().map((pr) => ignored.has(pr.key) ? { ...pr, ignored: true } : pr);
-    const worktrees = index.getSnapshot().worktrees;
+    const worktrees = worktreesOf(store, index);
     const missing = [];
     for (const wt of worktrees) {
+      if (wt.auto) continue;
       const pr = linkPr(wt, { prs, bindings: state.local.bindings, rules: state.cfg.rules });
       if (!pr || state.local.reviewing[pr.key]) continue;
       if (derive(pr, state.cfg.rules).key === "needs_review") missing.push(pr.key);
     }
     if (missing.length) {
-      for (const key of missing) store.markReviewing(key, Date.now());
+      for (const key of missing) store.markReviewing(key, now());
     }
-    const payload = buildPayload({ state, worktrees, prs, t });
+    const payload = buildPayload({ state, worktrees, prs, t, now: now() });
     const serialized = JSON.stringify(payload);
     if (serialized === lastSerialized) return;
     lastSerialized = serialized;
@@ -855,11 +2045,11 @@ var AUTH = /gh auth login|not logged in|authentication failed|bad credentials|HT
 var RATE = /rate limit|secondary rate|abuse detection|HTTP 429/i;
 var NETWORK = /could not resolve host|failed to connect|connection (reset|refused)|timed out|timeout|TLS|network is unreachable|unexpected EOF|\bEOF\b|HTTP 5\d\d/i;
 function classifyFailure(message) {
-  const text = String(message || "");
-  if (MISSING.test(text)) return "missing";
-  if (AUTH.test(text)) return "auth";
-  if (RATE.test(text)) return "rate_limit";
-  if (NETWORK.test(text)) return "network";
+  const text2 = String(message || "");
+  if (MISSING.test(text2)) return "missing";
+  if (AUTH.test(text2)) return "auth";
+  if (RATE.test(text2)) return "rate_limit";
+  if (NETWORK.test(text2)) return "network";
   return "other";
 }
 var READ_ONLY = /* @__PURE__ */ new Set([
@@ -895,8 +2085,18 @@ function assertReadOnlyArgs(args) {
   }
 }
 function assertGitArgs(args) {
-  const ok = Array.isArray(args) && args.length === 5 && args[0] === "-C" && args[2] === "remote" && args[3] === "get-url";
-  if (!ok) throw new GhError("denied", "git \u53EA\u5141\u8BB8 `git -C <path> remote get-url <remote>`");
+  const scoped = Array.isArray(args) && args[0] === "-C" && typeof args[1] === "string";
+  if (scoped && args[2] === "status") {
+    if (args.length === 5 && args[3] === "--porcelain" && args[4] === "--ignore-submodules=none") return;
+    throw new GhError("denied", "git status \u53EA\u5141\u8BB8 `git -C <path> status --porcelain --ignore-submodules=none`");
+  }
+  const ok = scoped && args.length === 5 && args[2] === "remote" && args[3] === "get-url";
+  if (!ok) {
+    throw new GhError(
+      "denied",
+      "git \u53EA\u5141\u8BB8 `git -C <path> remote get-url <remote>` \u4E0E `git -C <path> status --porcelain --ignore-submodules=none`"
+    );
+  }
 }
 function detectPlatform() {
   if (typeof navigator !== "undefined" && /win/i.test(navigator.userAgent || "")) return "win32";
@@ -940,9 +2140,9 @@ async function invokeOnce({ invoke, bin, args, timeoutMs, limiter, stats }) {
   }
 }
 function failureOf(result, bin, args) {
-  const text = `${result.stderr}
+  const text2 = `${result.stderr}
 ${result.stdout}`.trim();
-  return new GhError(classifyFailure(text), text || `${bin} \u6267\u884C\u5931\u8D25\uFF08${result.code}\uFF09`, {
+  return new GhError(classifyFailure(text2), text2 || `${bin} \u6267\u884C\u5931\u8D25\uFF08${result.code}\uFF09`, {
     bin,
     args,
     code: result.code
@@ -1005,6 +2205,16 @@ function createExec({
     if (result.code !== 0) throw failureOf(result, "git", args);
     return result;
   }
+  async function isDirty(path) {
+    const absolute = typeof path === "string" && (path.startsWith("/") || /^[A-Za-z]:[\\/]/.test(path));
+    if (!absolute) return true;
+    try {
+      const result = await runGit(["-C", path, "status", "--porcelain", "--ignore-submodules=none"]);
+      return result.stdout.trim().length > 0;
+    } catch {
+      return true;
+    }
+  }
   async function openUrl(url) {
     const href = assertGitHubUrl(url);
     const [bin, args] = openerFor(platform, href);
@@ -1014,7 +2224,7 @@ function createExec({
     }
     return true;
   }
-  return { runGh, runGit, openUrl, stats };
+  return { runGh, runGit, isDirty, openUrl, stats };
 }
 function describeGhError(error) {
   const kind = error?.kind || classifyFailure(error?.message);
@@ -1034,31 +2244,103 @@ function describeGhError(error) {
   }
 }
 
-// src/i18n.js
-function isEnglish(locale) {
-  return !/^zh/i.test(String(locale || ""));
+// src/automation/config.js
+var AUTO_STATUSES = /* @__PURE__ */ new Set([
+  "creating",
+  "created",
+  "adopted",
+  "failed",
+  "gave_up",
+  "canceled",
+  "removed"
+]);
+var isObject = (value) => !!value && typeof value === "object" && !Array.isArray(value);
+var str = (value) => typeof value === "string" ? value.trim() : "";
+var num = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
+var isHour = (value) => Number.isInteger(value) && value >= 0 && value <= 23;
+function sanitizeAutomation(raw) {
+  const out = { ...DEFAULT_AUTOMATION };
+  if (!isObject(raw)) return out;
+  if (typeof raw.autoWorktree === "boolean") out.autoWorktree = raw.autoWorktree;
+  if (typeof raw.autoWorktreeForks === "boolean") out.autoWorktreeForks = raw.autoWorktreeForks;
+  const max = Number(raw.autoWorktreeMax);
+  if (Number.isFinite(max)) out.autoWorktreeMax = Math.max(1, Math.min(AUTO_WT_MAX_LIMIT, Math.round(max)));
+  return out;
 }
-function createT(locale) {
-  const en = isEnglish(locale);
-  return (zh, enText) => en ? enText ?? zh : zh;
+function sanitizeNotifyCfg(raw) {
+  const out = { ...DEFAULT_NOTIFY };
+  if (!isObject(raw)) return out;
+  if (typeof raw.feishu === "boolean") out.feishu = raw.feishu;
+  if (typeof raw.quiet === "boolean") out.quiet = raw.quiet;
+  if (isHour(raw.quietStart)) out.quietStart = raw.quietStart;
+  if (isHour(raw.quietEnd)) out.quietEnd = raw.quietEnd;
+  return out;
 }
-var DEFAULT_DEFS_EN = {
-  needs_review: { label: "New", tone: "blue", owner: "me", badge: true },
-  reviewing: { label: "Rev", tone: "cyan", owner: "me", badge: true },
-  changes_requested: { label: "Chg", tone: "yellow", owner: "author", badge: true },
-  needs_rereview: { label: "Re", tone: "rose", owner: "me", badge: true },
-  approved: { label: "OK", tone: "green", owner: "merge", badge: true },
-  draft: { label: "Draft", tone: "neutral", owner: "author", badge: false },
-  merged: { label: "Merge", tone: "purple", owner: "done", badge: true },
-  closed: { label: "Closed", tone: "neutral", owner: "done", badge: true },
-  done: { label: "Done", tone: "lime", owner: "done", badge: true }
-};
-var OWNER_LABELS_EN = { me: "You", author: "Author", merge: "Merge", done: "Done" };
-function ownerLabel(owner, t) {
-  return t(
-    { me: "\u7B49\u6211", author: "\u7B49\u4F5C\u8005", merge: "\u7B49\u5408\u5E76", done: "\u5DF2\u7ED3\u675F" }[owner] || owner,
-    OWNER_LABELS_EN[owner] || owner
-  );
+function sanitizeFeishu(raw) {
+  if (!isObject(raw)) return { webhook: "", secret: "" };
+  return { webhook: str(raw.webhook), secret: str(raw.secret) };
+}
+function sanitizeRecord(raw) {
+  if (!isObject(raw) || !AUTO_STATUSES.has(raw.status)) return null;
+  return {
+    status: raw.status,
+    attempts: Math.max(0, Math.floor(num(raw.attempts))),
+    at: num(raw.at),
+    workspaceId: str(raw.workspaceId),
+    path: str(raw.path),
+    branch: str(raw.branch),
+    repo: str(raw.repo),
+    parentId: str(raw.parentId),
+    missingSince: num(raw.missingSince),
+    lastError: str(raw.lastError).slice(0, 300)
+  };
+}
+function sanitizeAutoRecords(raw) {
+  if (!isObject(raw) || raw.v !== STORE_VERSION || !isObject(raw.records)) return {};
+  const out = {};
+  for (const [key, value] of Object.entries(raw.records)) {
+    const record = sanitizeRecord(value);
+    if (record) out[key] = record;
+  }
+  return out;
+}
+function sanitizeBaselineRepos(raw) {
+  if (!isObject(raw)) return {};
+  const out = {};
+  for (const [slug, prs] of Object.entries(raw)) {
+    if (!isObject(prs)) continue;
+    const entries = Object.entries(prs).filter(([, v]) => isObject(v) && typeof v.s === "string");
+    out[slug] = Object.fromEntries(
+      entries.map(([key, v]) => [key, { s: v.s, n: num(v.n), t: str(v.t), u: str(v.u) }])
+    );
+  }
+  return out;
+}
+function sanitizeBaseline(raw) {
+  if (!isObject(raw)) return null;
+  const errors = isObject(raw.errors) ? Object.fromEntries(Object.entries(raw.errors).filter(([, v]) => typeof v === "string")) : {};
+  return { repos: sanitizeBaselineRepos(raw.repos), errors };
+}
+function emptyNotifyState() {
+  return { lastSlot: "", lastSentAt: 0, baseline: null, paused: null, lastResult: null };
+}
+function sanitizeNotifyState(raw) {
+  const out = emptyNotifyState();
+  if (!isObject(raw) || raw.v !== STORE_VERSION) return out;
+  out.lastSlot = str(raw.lastSlot);
+  out.lastSentAt = num(raw.lastSentAt);
+  out.baseline = sanitizeBaseline(raw.baseline);
+  if (isObject(raw.paused) && typeof raw.paused.kind === "string") {
+    out.paused = { kind: raw.paused.kind, message: str(raw.paused.message), at: num(raw.paused.at) };
+  }
+  if (isObject(raw.lastResult)) {
+    out.lastResult = {
+      ok: raw.lastResult.ok === true,
+      at: num(raw.lastResult.at),
+      message: str(raw.lastResult.message).slice(0, 300)
+    };
+  }
+  return out;
 }
 
 // src/domain/board.js
@@ -1093,21 +2375,21 @@ function dropPlan(pr, rules, toCol) {
   return { ok: true, base, mark, text: `\u6807\u8BB0\u300C${MARK_TEXT[mark]}\u300D` };
 }
 function applyDrop(pr, rules, toCol, ids, now) {
-  const plan = dropPlan(pr, rules, toCol);
-  if (!plan.ok) return { ok: false, reason: plan.text };
-  if (plan.reorder) return { ok: true, reorder: true, order: ids };
+  const plan2 = dropPlan(pr, rules, toCol);
+  if (!plan2.ok) return { ok: false, reason: plan2.text };
+  if (plan2.reorder) return { ok: true, reorder: true, order: ids };
   const beforeKey = derive(pr, rules).key;
-  const markEvent = plan.mark ? { type: "mark", verdict: plan.mark, via: "drag", at: now, sha: pr.headSha } : null;
-  const events = markEvent ? [...plan.base, markEvent] : plan.base;
+  const markEvent = plan2.mark ? { type: "mark", verdict: plan2.mark, via: "drag", at: now, sha: pr.headSha } : null;
+  const events = markEvent ? [...plan2.base, markEvent] : plan2.base;
   const afterKey = derive({ ...pr, events }, rules).key;
   return {
     ok: true,
     events,
     order: ids,
-    mark: plan.mark,
+    mark: plan2.mark,
     beforeKey,
     afterKey,
-    text: plan.text
+    text: plan2.text
   };
 }
 function sortColumn(rows, colKey, orderIds) {
@@ -1151,7 +2433,9 @@ function defaultConfig(repos = []) {
     rules: { ...DEFAULT_RULES },
     defs: { ...DEFAULT_DEFS },
     repos: repos.map((r) => ({ slug: r.slug, enabled: r.enabled !== false })),
-    extraAccounts: []
+    extraAccounts: [],
+    automation: { ...DEFAULT_AUTOMATION },
+    notify: { ...DEFAULT_NOTIFY }
   };
 }
 function initialState() {
@@ -1160,6 +2444,10 @@ function initialState() {
     cfg: defaultConfig(),
     snapshots: {},
     local: LOCAL_EMPTY(),
+    // 自动化数据各存独立 key：「清空本地数据」「恢复默认设置」都不会误删。
+    auto: {},
+    feishu: { webhook: "", secret: "" },
+    notify: emptyNotifyState(),
     runtime: {
       syncing: false,
       syncStartedAt: null,
@@ -1246,7 +2534,9 @@ function migrateConfig(raw) {
     ...base,
     rules: sanitizeRules(raw.rules),
     defs: sanitizeDefs(raw.defs),
-    extraAccounts: Array.isArray(raw.extraAccounts) ? raw.extraAccounts.map(String).filter(Boolean) : []
+    extraAccounts: Array.isArray(raw.extraAccounts) ? raw.extraAccounts.map(String).filter(Boolean) : [],
+    automation: sanitizeAutomation(raw.automation),
+    notify: sanitizeNotifyCfg(raw.notify)
   };
 }
 function migrateLocal(raw) {
@@ -1326,7 +2616,9 @@ function createCore(options) {
   return { load, now, getState, commit, subscribe, ...persistence };
 }
 async function loadState(core) {
-  const [rawCfg, rawLocal] = await Promise.all([core.load("cfg"), core.load("local")]);
+  const [rawCfg, rawLocal, rawAuto, rawFeishu, rawNotify] = await Promise.all(
+    ["cfg", "local", "auto", "feishu", "notify"].map((key) => core.load(key))
+  );
   const cfg = migrateConfig(rawCfg) || defaultConfig();
   const local = migrateLocal(rawLocal);
   const snapshots = {};
@@ -1334,7 +2626,16 @@ async function loadState(core) {
     const snap = migrateSnapshot(await core.load(`snap:${repo.slug}`));
     if (snap) snapshots[repo.slug] = snap;
   }
-  core.commit({ ...core.getState(), ready: true, cfg, local, snapshots });
+  core.commit({
+    ...core.getState(),
+    ready: true,
+    cfg,
+    local,
+    snapshots,
+    auto: sanitizeAutoRecords(rawAuto),
+    feishu: sanitizeFeishu(rawFeishu),
+    notify: sanitizeNotifyState(rawNotify)
+  });
 }
 function createConfigApi(core) {
   const updateCfg = (patch) => {
@@ -1354,6 +2655,8 @@ function createConfigApi(core) {
       }))
     }),
     setExtraAccounts: (list) => updateCfg({ extraAccounts: [...list] }),
+    setAutomation: (patch) => updateCfg({ automation: sanitizeAutomation({ ...core.getState().cfg.automation, ...patch }) }),
+    setNotifyCfg: (patch) => updateCfg({ notify: sanitizeNotifyCfg({ ...core.getState().cfg.notify, ...patch }) }),
     resetConfig: () => updateCfg(defaultConfig(core.getState().cfg.repos))
   };
 }
@@ -1473,6 +2776,29 @@ function createBindingApi(core, data, local) {
   };
   return { bind, unbind, pruneBindings, toggleIgnore, applyDropLocal, markReviewing, clearReviewing };
 }
+function createAutomationApi(core) {
+  const setAutoRecords = (records) => {
+    core.commit({ ...core.getState(), auto: records });
+    core.queueSave("auto", { v: STORE_VERSION, records });
+  };
+  const setAutoRecord = (prKey, record) => {
+    const next = { ...core.getState().auto };
+    if (record) next[prKey] = record;
+    else delete next[prKey];
+    setAutoRecords(next);
+  };
+  const setFeishu = (patch) => {
+    const feishu = sanitizeFeishu({ ...core.getState().feishu, ...patch });
+    core.commit({ ...core.getState(), feishu });
+    core.queueSave("feishu", feishu);
+  };
+  const setNotifyState = (patch) => {
+    const notify = { ...core.getState().notify, ...patch };
+    core.commit({ ...core.getState(), notify });
+    core.queueSave("notify", { v: STORE_VERSION, ...notify });
+  };
+  return { setAutoRecords, setAutoRecord, setFeishu, setNotifyState };
+}
 function createStore({
   load = async () => null,
   save = async () => {
@@ -1487,6 +2813,7 @@ function createStore({
   const data = createDataApi(core);
   const local = createLocalApi(core);
   const bindings = createBindingApi(core, data, local);
+  const automation = createAutomationApi(core);
   const restoreLocal = (partial) => local.updateLocal({ marks: partial.marks || {}, order: partial.order || {} });
   const clearLocal = () => local.updateLocal(LOCAL_EMPTY());
   return {
@@ -1498,158 +2825,10 @@ function createStore({
     ...data,
     ...local,
     ...bindings,
+    ...automation,
     restoreLocal,
     clearLocal
   };
-}
-
-// src/domain/stats.js
-var pad2 = (n) => String(n).padStart(2, "0");
-function dayStart(now, cutoffH = 0) {
-  const d = new Date(now);
-  d.setHours(cutoffH, 0, 0, 0);
-  if (d.getTime() > now) d.setDate(d.getDate() - 1);
-  return d.getTime();
-}
-function dateKey(ms) {
-  const d = new Date(ms);
-  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
-}
-function counts(rows, { defs, rules, now, excluded = 0, statusOrder = STATUS_ORDER }) {
-  const live = rows.filter((r) => !r.pr.ignored);
-  const byStatus = {};
-  for (const key of statusOrder) byStatus[key] = 0;
-  for (const r of live) byStatus[r.d.key] = (byStatus[r.d.key] || 0) + 1;
-  const ownerOf = (r) => defs[r.d.key].owner;
-  const today = dayStart(now, rules.dayCutoff);
-  return {
-    ...byStatus,
-    all: live.length,
-    mine: live.filter((r) => ownerOf(r) === "me").length,
-    author: live.filter((r) => ownerOf(r) === "author").length,
-    merge: live.filter((r) => ownerOf(r) === "merge").length,
-    active: live.filter((r) => ownerOf(r) !== "done").length,
-    done: live.filter((r) => ownerOf(r) === "done").length,
-    today: live.filter((r) => r.pr.createdAt >= today).length,
-    mergedToday: live.filter((r) => r.d.key === "merged" && r.d.since >= today).length,
-    overdue: live.filter((r) => r.f.overdue).length,
-    silent: live.filter((r) => r.f.silent).length,
-    ignored: rows.length - live.length,
-    excluded
-  };
-}
-function flowForPr(pr, rules, start, s) {
-  let seen = 0;
-  let waiting = false;
-  for (const e of pr.events || []) {
-    const isToday = e.at >= start;
-    if (e.type === "opened") {
-      if (isToday) {
-        s.opened += 1;
-        const key = pr.repoSlug || pr.repo;
-        s.byRepo[key] = (s.byRepo[key] || 0) + 1;
-        if (e.draft || pr.isDraft) s.drafts += 1;
-      }
-      continue;
-    }
-    if (isToday && e.type === "merged") s.merged += 1;
-    if (isToday && e.type === "closed") s.closed += 1;
-    if (e.type === "mark" && e.verdict === "reset") {
-      waiting = false;
-      continue;
-    }
-    const verdict = verdictOf(e, rules);
-    if (verdict) {
-      if (isToday) {
-        s[seen ? "re" : "first"] += 1;
-        s[verdict === "changes" ? "changes" : "approve"] += 1;
-      }
-      seen += 1;
-      waiting = verdict === "changes";
-      continue;
-    }
-    if (waiting && isAuthorFix(e, rules)) {
-      if (isToday) s.fixed += 1;
-      waiting = false;
-    }
-  }
-}
-function todayFlow(prs, rules, now) {
-  const start = dayStart(now, rules.dayCutoff);
-  const s = { opened: 0, drafts: 0, first: 0, re: 0, changes: 0, approve: 0, fixed: 0, merged: 0, closed: 0, byRepo: {} };
-  for (const pr of prs) flowForPr(pr, rules, start, s);
-  return s;
-}
-function isAuthorFix(e, rules) {
-  if (e.type === "commit") return !(rules.ignoreMergeBase && e.merge);
-  if (e.type === "rerequest") return rules.rerequest;
-  if (e.type === "comment" && e.isAuthor) return rules.authorReply;
-  return e.type === "mark" && e.verdict === "fixed";
-}
-function dailySeries(snapshots, repoList, rules, now, days = 14) {
-  const series = repoList.filter((r) => r.enabled).map((r) => ({
-    slug: r.slug,
-    colorIndex: repoList.findIndex((x) => x.slug === r.slug)
-  }));
-  const anchor = new Date(dayStart(now, rules.dayCutoff));
-  const out = [];
-  for (let i = days - 1; i >= 0; i -= 1) {
-    const d = new Date(anchor);
-    d.setDate(d.getDate() - i);
-    const at = d.getTime();
-    const key = dateKey(at);
-    out.push({
-      at,
-      key,
-      vals: series.map((r) => Number(snapshots[r.slug]?.daily?.[key] || 0))
-    });
-  }
-  return { series, days: out };
-}
-function selectRows(prs, { rules, meSet, repoFilter = "all", reposEnabled = {}, showIgnored = false, wts = [], bindings = {}, reviewingSince = {}, now }) {
-  return prs.filter((pr) => reposEnabled[pr.repoSlug] !== false).filter(
-    (pr) => repoFilter === "all" ? true : Array.isArray(repoFilter) ? repoFilter.includes(pr.repoSlug) : pr.repoSlug === repoFilter
-  ).filter((pr) => isTracked(pr, rules, meSet)).filter((pr) => showIgnored || !pr.ignored).map((pr) => {
-    const hasWorktree = wts.some(
-      (wt) => linkPr(wt, { prs, bindings, rules })?.key === pr.key
-    );
-    const d = reviewingState(derive(pr, rules), hasWorktree, reviewingSince[pr.key]);
-    return { pr, d, f: flags(d, rules, now) };
-  }).filter(({ d }) => rules.includeDraft || d.key !== "draft");
-}
-function flowByDay(prs, rules, now, days = 14) {
-  const anchor = new Date(dayStart(now, rules.dayCutoff));
-  const keys = [];
-  for (let i = days - 1; i >= 0; i -= 1) {
-    const d = new Date(anchor);
-    d.setDate(d.getDate() - i);
-    keys.push(dateKey(d.getTime()));
-  }
-  const map = Object.fromEntries(keys.map((k) => [k, { reviews: 0, fixed: 0, merged: 0 }]));
-  for (const pr of prs) {
-    let waiting = false;
-    for (const e of pr.events || []) {
-      const key = dateKey(dayStart(e.at, rules.dayCutoff));
-      const bucket = map[key];
-      if (e.type === "mark" && e.verdict === "reset") {
-        waiting = false;
-        continue;
-      }
-      const verdict = verdictOf(e, rules);
-      if (verdict) {
-        if (bucket) bucket.reviews += 1;
-        waiting = verdict === "changes";
-        continue;
-      }
-      if (waiting && isAuthorFix(e, rules)) {
-        if (bucket) bucket.fixed += 1;
-        waiting = false;
-        continue;
-      }
-      if (e.type === "merged" && bucket) bucket.merged += 1;
-    }
-  }
-  return keys.map((key) => ({ key, ...map[key] }));
 }
 
 // src/gh/normalize.js
@@ -2270,7 +3449,7 @@ function createSync({ exec, store, now = Date.now, viewer = fetchViewerLogin, on
     });
     return running;
   }
-  const meSetOf = (state) => new Set(
+  const meSetOf2 = (state) => new Set(
     [state.runtime.ghLogin, ...state.cfg.extraAccounts].filter(Boolean).map((v) => String(v).toLowerCase())
   );
   function findSnapshotPr(prKey) {
@@ -2286,7 +3465,7 @@ function createSync({ exec, store, now = Date.now, viewer = fetchViewerLogin, on
     if (!hit) return null;
     const updated = await fetchPrByNumber(hit.slug, hit.pr.number, {
       exec,
-      meSet: meSetOf(store.getSnapshot())
+      meSet: meSetOf2(store.getSnapshot())
     });
     if (!updated) return null;
     const snap = store.getSnapshot().snapshots[hit.slug];
@@ -2420,7 +3599,8 @@ function mergeRepoList(existing, discovered) {
   const added = discovered.filter((d) => !known.has(d.slug)).map((d) => ({ slug: d.slug, enabled: true, available: true }));
   return [...kept, ...added];
 }
-function createWorkspaceIndex({ ctx, exec, store, onUpdate }) {
+var defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+function createWorkspaceIndex({ ctx, exec, store, onUpdate, now = Date.now, sleep = defaultSleep }) {
   let snapshot = { repos: [], worktrees: [], loading: false, error: null };
   const listeners = /* @__PURE__ */ new Set();
   const getSnapshot = () => snapshot;
@@ -2453,7 +3633,17 @@ function createWorkspaceIndex({ ctx, exec, store, onUpdate }) {
       return snapshot;
     }
   }
-  return { getSnapshot, subscribe, refresh };
+  async function waitForWorktree(path, { timeoutMs = 5e3, intervalMs = 400 } = {}) {
+    const deadline = now() + timeoutMs;
+    for (; ; ) {
+      const snap = await refresh();
+      const hit = snap.worktrees.find((w) => w.path === path);
+      if (hit) return hit;
+      if (now() >= deadline) return null;
+      await sleep(intervalMs);
+    }
+  }
+  return { getSnapshot, subscribe, refresh, waitForWorktree };
 }
 
 // src/ui/react.js
@@ -2863,7 +4053,8 @@ function WorktreeButton({ t, wt, pr, bindings, rules, onWorktree, onBind, ended 
         }
       },
       h(Icon, { name: "branch", size: 12 }),
-      wt.name
+      wt.name,
+      wt.auto ? h("span", { className: "ght-wt-auto" }, t("\u81EA\u52A8 \xB7 \u5DF2\u5C31\u7EEA", "auto \xB7 ready")) : null
     );
   }
   if (ended) return null;
@@ -2974,9 +4165,9 @@ function notifyDrop(result, drag, defs, t, toast) {
   );
 }
 function performDrop({ event, colKey, drag, over, store, defs, visible, order, endedDays, now, toast, t }) {
-  const plan = drag.plans[colKey];
-  if (!plan?.ok) {
-    toast(t(`\u4E0D\u80FD\u653E\u5230\u8FD9\u91CC\uFF1A${plan?.text || ""}`, `Can't drop here: ${plan?.text || ""}`));
+  const plan2 = drag.plans[colKey];
+  if (!plan2?.ok) {
+    toast(t(`\u4E0D\u80FD\u653E\u5230\u8FD9\u91CC\uFF1A${plan2?.text || ""}`, `Can't drop here: ${plan2?.text || ""}`));
     return;
   }
   event.preventDefault();
@@ -3010,8 +4201,8 @@ function useBoardDrag({ store, rules, defs, visible, order, endedDays, now, toas
   };
   const columnOver = (event, colKey) => {
     if (!drag) return;
-    const plan = drag.plans[colKey];
-    if (!plan?.ok) {
+    const plan2 = drag.plans[colKey];
+    if (!plan2?.ok) {
       setOver({ col: colKey, ok: false, index: null });
       return;
     }
@@ -3096,14 +4287,14 @@ function BoardColumn({ t, col, defs, visible, order, endedDays, now, drag, over,
   const sorted = sortColumn(main, col.key, order[col.key] || []);
   const def = col.main ? defs[col.main] : null;
   const overdue = sorted.filter((r) => r.f.overdue).length;
-  const plan = drag?.plans[col.key];
+  const plan2 = drag?.plans[col.key];
   const showPlaceholder = drag && over?.col === col.key && over.ok;
   const body = useScrollMemory(`col:${col.key}`);
-  const hint = drag ? plan?.reorder ? t("\u5217\u5185\u62D6\u52A8 = \u8C03\u6574\u987A\u5E8F", "Same column = reorder") : plan?.ok ? t(`\u653E\u4E0B = ${plan.text}`, `Drop = ${plan.text}`) : t(`\u4E0D\u80FD\u653E\uFF1A${plan?.text || ""}`, `Can't drop: ${plan?.text || ""}`) : "";
+  const hint = drag ? plan2?.reorder ? t("\u5217\u5185\u62D6\u52A8 = \u8C03\u6574\u987A\u5E8F", "Same column = reorder") : plan2?.ok ? t(`\u653E\u4E0B = ${plan2.text}`, `Drop = ${plan2.text}`) : t(`\u4E0D\u80FD\u653E\uFF1A${plan2?.text || ""}`, `Can't drop: ${plan2?.text || ""}`) : "";
   return h(
     "section",
     {
-      className: cx("ght-bcol", drag && (plan?.ok ? "ght-can" : "ght-cannot"), over?.col === col.key && over.ok && "ght-over"),
+      className: cx("ght-bcol", drag && (plan2?.ok ? "ght-can" : "ght-cannot"), over?.col === col.key && over.ok && "ght-over"),
       "data-col": col.key
     },
     h(ColumnHeader, { t, col, def, count: sorted.length, overdue }),
@@ -3347,19 +4538,19 @@ function Timeline({ t, pr, rules, defs, now }) {
     const state = derive(slicePr(pr, index), rules);
     const changed = state.key !== prev;
     prev = state.key;
-    const text = evText(pr, event, pr.events, rules, t);
+    const text2 = evText(pr, event, pr.events, rules, t);
     const def = defs[state.key];
     const dot = changed ? toneColor(def.tone) : event.mine || event.type === "mark" ? "#94a3b8" : "#d4d4d4";
     return h(
       "li",
-      { key: `${event.type}-${event.at}-${index}`, className: cx("ght-tl-i", text.muted && "ght-muted") },
+      { key: `${event.type}-${event.at}-${index}`, className: cx("ght-tl-i", text2.muted && "ght-muted") },
       h("i", { className: "ght-tl-dot", style: { background: dot } }),
       h(
         "div",
         { className: "ght-tl-txt" },
-        text.text,
-        text.sha ? h("code", null, text.sha.slice(0, 7)) : null,
-        text.note ? h("span", { className: "ght-tl-note" }, text.note) : null
+        text2.text,
+        text2.sha ? h("code", null, text2.sha.slice(0, 7)) : null,
+        text2.note ? h("span", { className: "ght-tl-note" }, text2.note) : null
       ),
       h("div", { className: "ght-tl-time" }, fmtAbs(event.at, now, t)),
       changed ? h(
@@ -3452,10 +4643,15 @@ function NextCard({ t, pr, d, def, ns, now, onGh, onRefresh }) {
     )
   );
 }
-function useRemoveWorktree({ ctx, store, index, pr, wt, toast, t }) {
+function useRemoveWorktree({ ctx, store, index, pr, wt, toast, t, checkDirty }) {
   const [confirming, setConfirming] = React.useState(false);
   const remove = async () => {
     if (!wt) return;
+    if (wt.auto && checkDirty && await checkDirty(wt.path)) {
+      setConfirming(false);
+      toast(t("\u8FD9\u4E2A worktree \u6709\u672A\u63D0\u4EA4\u6539\u52A8\uFF0C\u5DF2\u53D6\u6D88\u5220\u9664", "This worktree has uncommitted changes; not removed"));
+      return;
+    }
     const repo = index.getSnapshot().repos.find((r) => r.slug === wt.repo);
     if (!repo) {
       toast(t("\u627E\u4E0D\u5230\u8FD9\u4E2A worktree \u6240\u5C5E\u7684\u4ED3\u5E93\u8DEF\u5F84", "Can't resolve the repository path for this worktree"));
@@ -3482,8 +4678,25 @@ function useRemoveWorktree({ ctx, store, index, pr, wt, toast, t }) {
   };
   return { confirming, setConfirming, remove };
 }
-function WorktreeActions({ t, ctx, store, index, pr, wt, bindings, terminal, toast, onBind, onWorktree }) {
-  const { confirming, setConfirming, remove } = useRemoveWorktree({ ctx, store, index, pr, wt, toast, t });
+function AdoptButton({ t, pr, wt, terminal, toast, onAdopt }) {
+  if (!wt?.auto || terminal || !onAdopt) return null;
+  return h(
+    "button",
+    {
+      key: "adopt",
+      type: "button",
+      className: "ght-btn ght-btn-pri",
+      title: t("\u8FD9\u4E2A worktree \u662F\u63D2\u4EF6\u81EA\u52A8\u5EFA\u7684\uFF1B\u70B9\u4E86\u4E4B\u540E PR \u8FDB\u5165\u300C\u5BA1\u67E5\u4E2D\u300D", "Auto-created; marks the PR as Reviewing"),
+      onClick: () => {
+        onAdopt(pr.key);
+        toast(t(`#${pr.number} \u5DF2\u8FDB\u5165\u5BA1\u67E5\u4E2D`, `#${pr.number} is now Reviewing`));
+      }
+    },
+    t("\u5F00\u59CB\u5BA1\u67E5", "Start review")
+  );
+}
+function WorktreeActions({ t, ctx, store, index, pr, wt, bindings, terminal, toast, onBind, onWorktree, onAdopt, checkDirty }) {
+  const { confirming, setConfirming, remove } = useRemoveWorktree({ ctx, store, index, pr, wt, toast, t, checkDirty });
   if (!wt) {
     return [
       h("span", { key: "s", className: "ght-src" }, t("\u8FD8\u6CA1\u6709\u5BF9\u5E94\u7684 worktree", "No worktree linked")),
@@ -3505,6 +4718,7 @@ function WorktreeActions({ t, ctx, store, index, pr, wt, bindings, terminal, toa
     h("b", { key: "n", className: "ght-mono" }, wt.name),
     h("span", { key: "s", className: "ght-src" }, linkSource(wt, pr, bindings)),
     h("span", { key: "sp", className: "ght-sp" }),
+    h(AdoptButton, { key: "adopt", t, pr, wt, terminal, toast, onAdopt }),
     ...terminal ? removeButtons : [h("button", { key: "copy", type: "button", className: "ght-btn", onClick: () => onWorktree(wt) }, t("\u590D\u5236\u8DEF\u5F84", "Copy path"))],
     bindings[pr.key] ? h(
       "button",
@@ -3522,7 +4736,7 @@ function WorktreeActions({ t, ctx, store, index, pr, wt, bindings, terminal, toa
     terminal ? null : h("button", { key: "change", type: "button", className: "ght-btn", onClick: () => onBind(pr.key) }, t("\u6362\u4E00\u4E2A\u2026", "Change\u2026"))
   ];
 }
-function WorktreeSection({ t, ctx, store, index, pr, wt, bindings, terminal, toast, onBind, onWorktree }) {
+function WorktreeSection({ t, ctx, store, index, pr, wt, bindings, terminal, toast, onBind, onWorktree, onAdopt, checkDirty }) {
   return h(
     "div",
     null,
@@ -3535,7 +4749,7 @@ function WorktreeSection({ t, ctx, store, index, pr, wt, bindings, terminal, toa
     h(
       "div",
       { className: "ght-wt-box" },
-      h(WorktreeActions, { t, ctx, store, index, pr, wt, bindings, terminal, toast, onBind, onWorktree })
+      h(WorktreeActions, { t, ctx, store, index, pr, wt, bindings, terminal, toast, onBind, onWorktree, onAdopt, checkDirty })
     )
   );
 }
@@ -3614,10 +4828,10 @@ function DrawerHeader({ t, pr, d, def, ignored, onGh, onClose, onRefresh }) {
     )
   );
 }
-function Drawer({ t, ctx, store, pr, rules, defs, now, wts, prs, bindings, index, toast, onClose, onGh, onRefresh, onBind, onWorktree }) {
+function Drawer({ t, ctx, store, pr, rules, defs, now, wts, prs, bindings, index, toast, onClose, onGh, onRefresh, onBind, onWorktree, onAdopt, checkDirty }) {
   const d = derive(pr, rules);
   const wt0 = wtFor(pr, { wts, prs, bindings, rules });
-  const dView = reviewingState(d, !!wt0, store.getSnapshot().local.reviewing[pr.key]);
+  const dView = reviewingState(d, !!wt0 && !wt0.auto, store.getSnapshot().local.reviewing[pr.key]);
   const def = defs[dView.key];
   const ns = nextStep(pr, dView, rules, now, t);
   const wt = wt0;
@@ -3632,7 +4846,7 @@ function Drawer({ t, ctx, store, pr, rules, defs, now, wts, prs, bindings, index
         "div",
         { className: "ght-dr-body" },
         h(NextCard, { t, pr, d: dView, def, ns, now, onGh, onRefresh }),
-        h(WorktreeSection, { t, ctx, store, index, pr, wt, bindings, terminal, toast, onBind, onWorktree }),
+        h(WorktreeSection, { t, ctx, store, index, pr, wt, bindings, terminal, toast, onBind, onWorktree, onAdopt, checkDirty }),
         h(
           "div",
           null,
@@ -3646,20 +4860,7 @@ function Drawer({ t, ctx, store, pr, rules, defs, now, wts, prs, bindings, index
   ];
 }
 
-// src/ui/SettingsModal.js
-var pad3 = (n) => String(n).padStart(2, "0");
-var SECTIONS = [
-  ["src", "\u6570\u636E\u6765\u6E90", "Data source"],
-  ["scope", "\u8DDF\u8E2A\u8303\u56F4", "Scope"],
-  ["rules", "\u72B6\u6001\u5224\u5B9A", "Verdicts"],
-  ["timeout", "\u8D85\u65F6\u63D0\u9192", "Overdue"],
-  ["look", "\u72B6\u6001\u5916\u89C2", "Appearance"],
-  ["board", "\u770B\u677F", "Board"],
-  ["wt", "Worktree \u5FBD\u6807", "Worktree badges"],
-  ["sync", "\u540C\u6B65\u4E0E\u7EDF\u8BA1", "Sync & stats"],
-  ["local", "\u672C\u5730\u6570\u636E", "Local data"],
-  ["roadmap", "\u8DEF\u7EBF\u56FE", "Roadmap"]
-];
+// src/ui/settingsKit.js
 function Row({ label, hint, children, stack }) {
   return h(
     "div",
@@ -3699,6 +4900,356 @@ function Seg({ value, options, onChange }) {
     )
   );
 }
+function Section({ id, title, sub, children }) {
+  return h(
+    "div",
+    { className: "ght-sec", "data-sec": id, id: `ght-sec-${id}` },
+    h("div", { className: "ght-sec-h2" }, h("h4", null, title), sub ? h("span", null, sub) : null),
+    h("div", { className: "ght-sec-box" }, children)
+  );
+}
+
+// src/ui/autoText.js
+var SKIP_LABELS = {
+  fork: ["\u6765\u81EA fork", "from forks"],
+  hasWorktree: ["\u5DF2\u6709 worktree", "already have a worktree"],
+  mine: ["\u4F60\u81EA\u5DF1\u7684", "yours"],
+  record: ["\u53D6\u6D88\u8FC7 / \u5220\u8FC7 / \u5DF2\u653E\u5F03", "canceled / removed / gave up"],
+  retryLater: ["\u5931\u8D25\u5F85\u91CD\u8BD5", "retrying later"],
+  syncError: ["\u4ED3\u5E93\u540C\u6B65\u5931\u8D25", "repo sync failed"],
+  noRepo: ["\u672C\u5730\u6CA1\u6709\u5BF9\u5E94\u5DE5\u4F5C\u533A", "no local workspace"]
+};
+function skipText(t, skipped = {}) {
+  return Object.keys(SKIP_LABELS).filter((key) => skipped[key]).map((key) => `${t(...SKIP_LABELS[key])} ${skipped[key]}`).join(" \xB7 ");
+}
+function planHint(t, info, failed) {
+  const parts = [
+    t(
+      `\u6700\u591A\u4FDD\u7559 ${info.max} \u4E2A\uFF0C\u5F53\u524D ${info.alive} \u4E2A\uFF08\u70B9\u4E86\u300C\u5F00\u59CB\u5BA1\u67E5\u300D\u7684\u4E0D\u8BA1\u5165\uFF09`,
+      `keeps up to ${info.max}, ${info.alive} now`
+    )
+  ];
+  if (info.enabled) {
+    const skipped = skipText(t, info.skipped);
+    parts.push(
+      t(`\u5F85\u5BA1\u67E5 ${info.total} \u4E2A\uFF0C\u53EF\u5EFA ${info.eligible} \u4E2A`, `${info.total} awaiting review, ${info.eligible} eligible`) + (skipped ? t(`\uFF08\u8DF3\u8FC7\uFF1A${skipped}\uFF09`, ` (skipped: ${skipped})`) : "")
+    );
+  }
+  if (info.capped) parts.push(t(`\u5DF2\u8FBE\u4E0A\u9650\uFF0C\u8FD8\u6709 ${info.waiting} \u4E2A\u5F85\u5EFA`, `limit reached, ${info.waiting} waiting`));
+  if (info.breaker) parts.push(t("\u8FDE\u7EED\u5931\u8D25\u5DF2\u7194\u65AD\uFF0C\u6BCF 30 \u5206\u949F\u8BD5\u63A2 1 \u4E2A", "paused after repeated failures; probing every 30 min"));
+  if (failed) parts.push(t(`\u5931\u8D25 ${failed} \u4E2A`, `${failed} failed`));
+  return parts.join(" \xB7 ");
+}
+function noneText(t, plan2, cfg) {
+  if (!plan2?.total) return t("\u770B\u677F\u300C\u5F85\u5BA1\u67E5\u300D\u91CC\u6CA1\u6709 PR\uFF0C\u6CA1\u6709\u53EF\u5EFA\u7684", "No PRs awaiting review");
+  const forkHint = plan2.skipped?.fork && !cfg.autoWorktreeForks ? t("\u3002\u8981\u5EFA fork \u6765\u7684 PR\uFF0C\u6253\u5F00\u300C\u5305\u542B\u6765\u81EA fork \u7684 PR\u300D", ". Turn on \u201CInclude PRs from forks\u201D to create them") : "";
+  return t(
+    `\u6CA1\u6709\u53EF\u65B0\u5EFA\u7684\uFF1A\u5F85\u5BA1\u67E5 ${plan2.total} \u4E2A\uFF0C\u8DF3\u8FC7 ${skipText(t, plan2.skipped)}${forkHint}`,
+    `Nothing to create: ${plan2.total} awaiting review, skipped ${skipText(t, plan2.skipped)}${forkHint}`
+  );
+}
+function runResultText(t, out, cfg, now = Date.now()) {
+  switch (out?.reason) {
+    case "created": {
+      const waiting = out.plan?.waiting || 0;
+      const rest = out.manual ? t(`\u5DF2\u8FBE\u4E0A\u9650\uFF0C\u8FD8\u6709 ${waiting} \u4E2A\u6CA1\u5EFA`, `limit reached, ${waiting} not created`) : t(`\u8FD8\u6709 ${waiting} \u4E2A\u540E\u53F0\u4E0B\u4E00\u8F6E\u518D\u5EFA\uFF08\u70B9\u300C\u6267\u884C\u300D\u53EF\u4E00\u6B21\u5EFA\u5B8C\uFF09`, `${waiting} more next round (click Run to create all)`);
+      const extra = [out.failed ? t(`\u5931\u8D25 ${out.failed} \u4E2A`, `${out.failed} failed`) : "", waiting ? rest : ""].filter(Boolean);
+      return t(`\u5DF2\u65B0\u5EFA ${out.created} \u4E2A worktree\uFF0C\u4FA7\u680F\u53EF\u770B\u8FDB\u5EA6`, `Created ${out.created} worktrees`) + (extra.length ? `\uFF1B${extra.join("\uFF1B")}` : "");
+    }
+    case "failed":
+      return t(`\u5C1D\u8BD5\u65B0\u5EFA ${out.failed} \u4E2A\u90FD\u5931\u8D25\u4E86\uFF0C\u539F\u56E0\u89C1\u4FA7\u680F\u7684\u5931\u8D25\u884C`, `All ${out.failed} attempts failed; see the sidebar`);
+    case "none":
+      return noneText(t, out.plan, cfg);
+    case "capped":
+      return t(`\u5DF2\u8FBE\u4E0A\u9650 ${cfg.autoWorktreeMax} \u4E2A\uFF1A\u5148\u6E05\u7406\u5DF2\u7ED3\u675F\u7684\uFF0C\u6216\u8C03\u9AD8\u4E0A\u9650`, `Limit of ${cfg.autoWorktreeMax} reached`);
+    case "breaker": {
+      const minutes = Math.max(1, Math.ceil(((out.until || now) - now) / 6e4));
+      return t(`\u8FDE\u7EED\u5931\u8D25\u5DF2\u7194\u65AD\uFF0C${minutes} \u5206\u949F\u540E\u81EA\u52A8\u8BD5\u63A2\uFF1B\u70B9\u300C\u91CD\u7F6E\u5931\u8D25\u300D\u53EF\u7ACB\u5373\u91CD\u8BD5`, `Paused after failures; retrying in ${minutes} min`);
+    }
+    case "noLogin":
+      return t("\u8FD8\u6CA1\u62FF\u5230 gh \u767B\u5F55\u540D\uFF08\u65E0\u6CD5\u6392\u9664\u4F60\u81EA\u5DF1\u7684 PR\uFF09\uFF0C\u5148\u540C\u6B65\u4E00\u6B21\u518D\u8BD5", "No gh login yet; sync first");
+    case "indexNotReady":
+      return t("\u4FA7\u680F\u5DE5\u4F5C\u533A\u8FD8\u6CA1\u52A0\u8F7D\u597D\uFF0C\u7A0D\u540E\u518D\u8BD5", "Sidebar workspaces are still loading");
+    case "disabled":
+      return t("\u300C\u81EA\u52A8\u521B\u5EFA worktree\u300D\u6CA1\u5F00", "Auto-create is off");
+    default:
+      return t("\u5DF2\u6267\u884C", "Done");
+  }
+}
+
+// src/ui/AutomationSection.js
+var pad4 = (n) => String(n).padStart(2, "0");
+var HOURS = Array.from({ length: 24 }, (_, i) => i);
+var timeText = (ms) => ms ? new Date(ms).toLocaleString() : "";
+function MaxInput({ value, onCommit }) {
+  const [draft, setDraft] = React.useState(String(value));
+  React.useEffect(() => setDraft(String(value)), [value]);
+  const commit = () => {
+    const n = Math.round(Number(draft));
+    if (!draft.trim() || !Number.isFinite(n)) return setDraft(String(value));
+    onCommit(Math.max(1, Math.min(AUTO_WT_MAX_LIMIT, n)));
+  };
+  return h("input", {
+    className: "ght-numin",
+    type: "number",
+    min: 1,
+    max: AUTO_WT_MAX_LIMIT,
+    value: draft,
+    onChange: (e) => setDraft(e.target.value),
+    onBlur: commit,
+    onKeyDown: (e) => {
+      if (e.key === "Enter") commit();
+    }
+  });
+}
+function CleanupRow({ t, auto, toast }) {
+  const [confirming, setConfirming] = React.useState(false);
+  const [busy, setBusy] = React.useState(false);
+  const items = auto.cleanable();
+  const run = async () => {
+    setBusy(true);
+    const out = await auto.cleanup(items);
+    setBusy(false);
+    setConfirming(false);
+    const skipped = out.skipped ? t(`\uFF1B${out.skipped} \u4E2A\u60C5\u51B5\u5DF2\u53D8\u5316\u672A\u5220`, `; ${out.skipped} changed meanwhile`) : "";
+    toast(t(`\u5DF2\u5220\u9664 ${out.removed} \u4E2A\uFF1B${out.dirty} \u4E2A\u6709\u672A\u63D0\u4EA4\u6539\u52A8\u5DF2\u8DF3\u8FC7\uFF1B${out.failed} \u4E2A\u5931\u8D25${skipped}`, `Removed ${out.removed}; skipped ${out.dirty} with changes; ${out.failed} failed${skipped}`));
+  };
+  const buttons = confirming ? [
+    h("button", { key: "y", type: "button", className: "ght-btn ght-btn-danger", disabled: busy, onClick: run }, busy ? t("\u6E05\u7406\u4E2D\u2026", "Cleaning\u2026") : t("\u786E\u8BA4\u6E05\u7406", "Confirm")),
+    h("button", { key: "n", type: "button", className: "ght-btn", disabled: busy, onClick: () => setConfirming(false) }, t("\u53D6\u6D88", "Cancel"))
+  ] : [h("button", { key: "c", type: "button", className: "ght-btn", disabled: !items.length, onClick: () => setConfirming(true) }, t(`\u6E05\u7406 ${items.length} \u4E2A`, `Clean ${items.length}`))];
+  return h(
+    Row,
+    {
+      label: t("\u6E05\u7406\u5DF2\u7ED3\u675F PR \u7684\u81EA\u52A8 worktree", "Clean up auto worktrees of ended PRs"),
+      hint: t(
+        "\u53EA\u5220\u63D2\u4EF6\u81EA\u52A8\u5EFA\u3001\u4F60\u6CA1\u5F00\u59CB\u5BA1\u67E5\u7684\uFF1B\u6709\u672A\u63D0\u4EA4\u6539\u52A8\u7684\u8DF3\u8FC7\uFF1B\u4E0D\u5220\u5206\u652F\u3002\u6CE8\u610F\uFF1A\u88AB .gitignore \u5FFD\u7565\u7684\u6587\u4EF6\uFF08\u5982 .env.local\uFF09\u4F1A\u968F\u76EE\u5F55\u4E00\u8D77\u5220\u9664",
+        "Only untouched auto worktrees; dirty ones are skipped; branches are kept. Git-ignored files are deleted with the directory"
+      )
+    },
+    h("span", { className: "ght-btns" }, buttons)
+  );
+}
+function useRunAuto({ t, auto, cfg, toast }) {
+  const [busy, setBusy] = React.useState(false);
+  const [progress, setProgress] = React.useState(null);
+  const run = async (manual = true) => {
+    setBusy(true);
+    setProgress(null);
+    try {
+      toast(runResultText(t, await auto.run({ manual, onProgress: setProgress }), cfg));
+    } catch (error) {
+      toast(t(`\u6267\u884C\u5931\u8D25\uFF1A${error?.message || error}`, `Run failed: ${error?.message || error}`));
+    } finally {
+      setBusy(false);
+      setProgress(null);
+    }
+  };
+  const label = !busy ? t("\u6267\u884C", "Run") : progress?.total ? t(`\u6267\u884C\u4E2D ${progress.done}/${progress.total}\u2026`, `Running ${progress.done}/${progress.total}\u2026`) : t("\u6267\u884C\u4E2D\u2026", "Running\u2026");
+  return { busy, run, label };
+}
+function AutoWorktreeBlock({ t, store, state, auto, toast }) {
+  const cfg = state.cfg.automation;
+  const info = auto.status();
+  const runner = useRunAuto({ t, auto, cfg, toast });
+  const failed = Object.values(state.auto).filter((r) => r.status === "failed" || r.status === "gave_up").length;
+  return [
+    h(Row, {
+      key: "on",
+      label: t("\u81EA\u52A8\u521B\u5EFA worktree", "Auto-create worktrees"),
+      hint: t(
+        `\u770B\u677F\u300C\u5F85\u5BA1\u67E5\u300D\u91CC\u8FD8\u6CA1\u6709 worktree \u7684 PR \u81EA\u52A8\u5EFA\uFF08\u8DF3\u8FC7\u8349\u7A3F / \u5DF2\u5FFD\u7565 / \u4F60\u81EA\u5DF1\u7684 PR\uFF09\u3002\u540E\u53F0\u6BCF\u6B21\u540C\u6B65\u6700\u591A\u65B0\u5EFA ${AUTO_WT_PER_RUN} \u4E2A\uFF0C\u70B9\u4E0B\u9762\u7684\u300C\u6267\u884C\u300D\u4E00\u6B21\u5EFA\u5230\u4E0A\u9650\u3002\u81EA\u52A8\u5EFA\u7684\u4E0D\u7B97\u300C\u5BA1\u67E5\u4E2D\u300D\uFF0C\u5728\u8BE6\u60C5\u91CC\u70B9\u300C\u5F00\u59CB\u5BA1\u67E5\u300D\u624D\u7B97`,
+        `PRs in "To review" without a worktree get one (drafts, ignored and your own PRs skipped). Background syncs create up to ${AUTO_WT_PER_RUN} each; "Run" creates up to the limit at once. Auto worktrees don't count as "Reviewing" until you click "Start review"`
+      )
+    }, h(Switch, {
+      checked: cfg.autoWorktree,
+      label: "autoWorktree",
+      onChange: (v) => {
+        store.setAutomation({ autoWorktree: v });
+        if (v) runner.run(false);
+      }
+    })),
+    h(Row, {
+      key: "forks",
+      label: t("\u5305\u542B\u6765\u81EA fork \u7684 PR", "Include PRs from forks"),
+      hint: t(
+        "\u9ED8\u8BA4\u4E0D\u5EFA\uFF1Afork \u7684 PR \u4EFB\u4F55\u4EBA\u90FD\u80FD\u63D0\uFF0C\u68C0\u51FA\u65F6\u4F1A\u89E6\u53D1\u4F60\u672C\u673A\u7684 git \u94A9\u5B50\uFF08husky / lefthook \u7B49\u53EF\u80FD\u6267\u884C PR \u91CC\u7684\u5B89\u88C5\u811A\u672C\uFF09",
+        "Off by default: anyone can open a fork PR, and checkout runs your local git hooks"
+      )
+    }, h(Switch, { checked: cfg.autoWorktreeForks, label: "autoWorktreeForks", onChange: (v) => store.setAutomation({ autoWorktreeForks: v }) })),
+    h(
+      Row,
+      { key: "max", label: t("\u81EA\u52A8 worktree \u4E0A\u9650", "Auto worktree limit"), hint: planHint(t, info, failed) },
+      h("span", { className: "ght-inline" }, h(MaxInput, { value: cfg.autoWorktreeMax, onCommit: (n) => store.setAutomation({ autoWorktreeMax: n }) }), t("\u4E2A", ""))
+    ),
+    h(
+      Row,
+      { key: "act", label: t("\u7ACB\u5373\u6267\u884C", "Run now"), hint: t("\u4E00\u6B21\u5EFA\u5230\u4E0A\u9650\uFF08\u4E0D\u53D7\u540E\u53F0\u6BCF\u8F6E 5 \u4E2A\u7684\u9650\u5236\uFF09\uFF1B\u91CD\u7F6E\u4F1A\u6E05\u6389\u5931\u8D25\u8BB0\u5F55\uFF0C\u8BA9\u8FD9\u4E9B PR \u91CD\u65B0\u5C1D\u8BD5", "Creates up to the limit at once; reset clears failures so those PRs are retried") },
+      h(
+        "span",
+        { className: "ght-btns" },
+        h("button", { type: "button", className: "ght-btn", disabled: !cfg.autoWorktree || runner.busy, onClick: () => runner.run(true) }, runner.label),
+        h("button", {
+          type: "button",
+          className: "ght-btn",
+          disabled: !failed && !info.breaker,
+          onClick: () => {
+            const n = auto.resetFailures();
+            toast(t(`\u5DF2\u91CD\u7F6E ${n} \u6761\u5931\u8D25\u8BB0\u5F55`, `Reset ${n} failures`));
+          }
+        }, t("\u91CD\u7F6E\u5931\u8D25", "Reset failures"))
+      )
+    ),
+    h(CleanupRow, { key: "clean", t, auto, toast })
+  ];
+}
+function SecretField({ t, store, digest, toast, field, label, hint, placeholder, validate, display }) {
+  const saved = store.getSnapshot().feishu[field];
+  const [editing, setEditing] = React.useState(!saved);
+  const [draft, setDraft] = React.useState("");
+  const save = () => {
+    const clearing = !draft.trim();
+    const check = clearing ? { ok: true, value: "" } : validate(draft);
+    if (!check.ok) return toast(t("\u683C\u5F0F\u4E0D\u5BF9\uFF0C\u8BF7\u68C0\u67E5\u540E\u518D\u4FDD\u5B58", "Invalid format"));
+    store.setFeishu({ [field]: check.value });
+    if (field === "webhook") {
+      if (clearing) store.setNotifyCfg({ feishu: false });
+      digest.onTargetChanged();
+    }
+    setDraft("");
+    setEditing(!check.value);
+    toast(clearing ? t("\u5DF2\u6E05\u9664", "Cleared") : t("\u5DF2\u4FDD\u5B58", "Saved"));
+  };
+  const body = editing ? [
+    h("input", { key: "i", className: "ght-sel ght-secret-in", type: "password", autoComplete: "off", value: draft, placeholder, onChange: (e) => setDraft(e.target.value) }),
+    h("button", { key: "s", type: "button", className: "ght-btn", onClick: save }, t("\u4FDD\u5B58", "Save"))
+  ] : [
+    h("code", { key: "v", className: "ght-mono ght-secret-v" }, display(saved)),
+    h("button", { key: "e", type: "button", className: "ght-btn", onClick: () => setEditing(true) }, t("\u4FEE\u6539", "Edit"))
+  ];
+  return h(Row, { label, hint }, h("span", { className: "ght-btns" }, body));
+}
+function QuietRow({ t, store, cfg }) {
+  const select = (key) => h(
+    "select",
+    { className: "ght-sel", value: String(cfg[key]), disabled: !cfg.quiet, onChange: (e) => store.setNotifyCfg({ [key]: Number(e.target.value) }) },
+    HOURS.map((hour) => h("option", { key: hour, value: String(hour) }, `${pad4(hour)}:00`))
+  );
+  return h(
+    Row,
+    { label: t("\u9759\u9ED8\u65F6\u6BB5", "Quiet hours"), hint: t("\u8FD9\u6BB5\u65F6\u95F4\u4E0D\u53D1\uFF0C\u7ED3\u675F\u540E\u628A\u7D2F\u79EF\u7684\u53D8\u5316\u5408\u5E76\u6210\u4E00\u6761", "Changes during quiet hours are merged into the next message") },
+    h(
+      "span",
+      { className: "ght-inline" },
+      h(Switch, { checked: cfg.quiet, label: "quiet", onChange: (v) => store.setNotifyCfg({ quiet: v }) }),
+      select("quietStart"),
+      "\u2014",
+      select("quietEnd")
+    )
+  );
+}
+function notifyStatus(t, notify) {
+  if (notify.paused) return t(`\u5DF2\u6682\u505C\uFF1A${notify.paused.message}`, `Paused: ${notify.paused.message}`);
+  const parts = [];
+  if (notify.lastSentAt) parts.push(t(`\u4E0A\u6B21\u53D1\u9001 ${timeText(notify.lastSentAt)}`, `Last sent ${timeText(notify.lastSentAt)}`));
+  if (notify.lastResult && !notify.lastResult.ok) parts.push(notify.lastResult.message);
+  return parts.join(" \xB7 ") || t("\u8FD8\u6CA1\u53D1\u8FC7", "Nothing sent yet");
+}
+function NotifyStatusRow({ t, state, digest, toast }) {
+  const [busy, setBusy] = React.useState(false);
+  const test = async () => {
+    setBusy(true);
+    try {
+      const out = await digest.sendTest();
+      toast(out.ok ? t("\u6D4B\u8BD5\u6D88\u606F\u5DF2\u53D1\u9001\uFF0C\u8BF7\u5230\u98DE\u4E66\u7FA4\u67E5\u770B", "Test message sent") : out.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return h(
+    Row,
+    { label: t("\u72B6\u6001", "Status"), hint: notifyStatus(t, state.notify) },
+    h(
+      "span",
+      { className: "ght-btns" },
+      state.notify.paused ? h("button", { type: "button", className: "ght-btn", onClick: () => digest.resume() }, t("\u6062\u590D", "Resume")) : null,
+      h("button", { type: "button", className: "ght-btn", disabled: busy || !validateWebhook(state.feishu.webhook).ok, onClick: test }, busy ? t("\u53D1\u9001\u4E2D\u2026", "Sending\u2026") : t("\u53D1\u9001\u6D4B\u8BD5\u6D88\u606F", "Send test"))
+    )
+  );
+}
+function FeishuBlock({ t, store, state, digest, toast }) {
+  const cfg = state.cfg.notify;
+  const hookOk = validateWebhook(state.feishu.webhook).ok;
+  const shared = { t, store, digest, toast };
+  return [
+    h(Row, {
+      key: "on",
+      label: t("\u98DE\u4E66\u6BCF\u5C0F\u65F6\u6C47\u603B", "Hourly Feishu digest"),
+      hint: hookOk ? t("\u6574\u70B9\u53D1\u9001\uFF1A\u6BCF\u4E2A\u4ED3\u5E93\u672A\u5408\u5E76\u51E0\u4E2A\u3001\u54EA\u4E9B PR \u72B6\u6001\u53D8\u4E86\uFF1B\u548C\u4E0A\u6B21\u53D1\u51FA\u7684\u76F8\u6BD4\u6CA1\u6709\u53D8\u5316\u5C31\u4E0D\u53D1", "Sent on the hour; skipped when nothing changed since the last message") : t("\u5148\u586B\u5199\u4E0B\u9762\u7684 webhook \u5730\u5740", "Fill in the webhook URL below first")
+    }, h(Switch, {
+      checked: cfg.feishu && hookOk,
+      label: "feishu",
+      onChange: (v) => {
+        if (v && !hookOk) return;
+        store.setNotifyCfg({ feishu: v });
+        if (v) {
+          digest.onTargetChanged();
+          digest.check();
+        }
+      }
+    })),
+    h(SecretField, {
+      ...shared,
+      key: "hook",
+      field: "webhook",
+      label: t("Webhook \u5730\u5740", "Webhook URL"),
+      hint: t(
+        "\u98DE\u4E66\u7FA4 \u203A \u8BBE\u7F6E \u203A \u7FA4\u673A\u5668\u4EBA \u203A \u6DFB\u52A0\u81EA\u5B9A\u4E49\u673A\u5668\u4EBA\uFF1B\u53EA\u652F\u6301 open.feishu.cn\u3002\u7559\u7A7A\u4FDD\u5B58\u5373\u6E05\u9664\u3002PR \u6807\u9898\u4F1A\u53D1\u5230\u7FA4\u91CC\uFF0C\u79C1\u6709\u4ED3\u5E93\u8BF7\u786E\u8BA4\u7FA4\u6210\u5458\u53EF\u89C1\u8303\u56F4\uFF1B\u591A\u53F0\u7535\u8111\u914D\u7F6E\u540C\u4E00\u4E2A\u673A\u5668\u4EBA\u4F1A\u5404\u81EA\u53D1\u9001",
+        "Group settings \u203A Bots \u203A Custom bot; open.feishu.cn only. Save empty to clear. PR titles are posted to the group"
+      ),
+      placeholder: "https://open.feishu.cn/open-apis/bot/v2/hook/\u2026",
+      validate: validateWebhook,
+      display: maskWebhook
+    }),
+    h(SecretField, {
+      ...shared,
+      key: "secret",
+      field: "secret",
+      label: t("\u7B7E\u540D\u5BC6\u94A5\uFF08\u53EF\u9009\uFF09", "Signing secret (optional)"),
+      hint: t("\u673A\u5668\u4EBA\u5F00\u542F\u300C\u7B7E\u540D\u6821\u9A8C\u300D\u65F6\u586B\u5199\uFF1B\u7559\u7A7A\u4FDD\u5B58\u5373\u6E05\u9664", "Required when signature verification is on; save empty to clear"),
+      placeholder: t("\u7559\u7A7A = \u4E0D\u7B7E\u540D", "empty = no signature"),
+      validate: validateSecret,
+      display: () => "\u2022\u2022\u2022\u2022\u2022\u2022"
+    }),
+    h(QuietRow, { key: "quiet", t, store, cfg }),
+    h(NotifyStatusRow, { key: "status", t, state, digest, toast })
+  ];
+}
+function AutomationSection({ t, store, state, toast, auto, digest }) {
+  if (!auto || !digest) return null;
+  return h(
+    Section,
+    { id: "auto", title: t("\u81EA\u52A8\u5316", "Automation"), sub: t("\u5BA2\u6237\u7AEF\u8FD0\u884C\u65F6\u5728\u540E\u53F0\u5DE5\u4F5C\uFF1B\u5173\u95ED\u6216\u7535\u8111\u7761\u7720\u65F6\u6682\u505C", "Runs while the app is open") },
+    h(AutoWorktreeBlock, { t, store, state, auto, toast }),
+    h(FeishuBlock, { t, store, state, digest, toast })
+  );
+}
+
+// src/ui/SettingsModal.js
+var pad5 = (n) => String(n).padStart(2, "0");
+var SECTIONS = [
+  ["src", "\u6570\u636E\u6765\u6E90", "Data source"],
+  ["scope", "\u8DDF\u8E2A\u8303\u56F4", "Scope"],
+  ["rules", "\u72B6\u6001\u5224\u5B9A", "Verdicts"],
+  ["timeout", "\u8D85\u65F6\u63D0\u9192", "Overdue"],
+  ["look", "\u72B6\u6001\u5916\u89C2", "Appearance"],
+  ["board", "\u770B\u677F", "Board"],
+  ["wt", "Worktree \u5FBD\u6807", "Worktree badges"],
+  ["sync", "\u540C\u6B65\u4E0E\u7EDF\u8BA1", "Sync & stats"],
+  ["auto", "\u81EA\u52A8\u5316", "Automation"],
+  ["local", "\u672C\u5730\u6570\u636E", "Local data"],
+  ["roadmap", "\u8DEF\u7EBF\u56FE", "Roadmap"]
+];
 function Num({ value, onChange, suffix }) {
   return h(
     "span",
@@ -3712,14 +5263,6 @@ function Num({ value, onChange, suffix }) {
       onChange: (event) => onChange(Math.max(0, Math.min(99, Number(event.target.value) || 0)))
     }),
     suffix
-  );
-}
-function Section({ id, title, sub, children }) {
-  return h(
-    "div",
-    { className: "ght-sec", "data-sec": id, id: `ght-sec-${id}` },
-    h("div", { className: "ght-sec-h2" }, h("h4", null, title), sub ? h("span", null, sub) : null),
-    h("div", { className: "ght-sec-box" }, children)
   );
 }
 function TagsInput({ t, values, onChange, placeholder }) {
@@ -4050,7 +5593,7 @@ function SyncSection({ t, store, rules, state, onSync }) {
       h(
         "select",
         { className: "ght-sel", value: String(rules.dayCutoff), onChange: (e) => store.setRules({ dayCutoff: Number(e.target.value) }) },
-        [0, 4, 6].map((hour) => h("option", { key: hour, value: String(hour) }, `${pad3(hour)}:00`))
+        [0, 4, 6].map((hour) => h("option", { key: hour, value: String(hour) }, `${pad5(hour)}:00`))
       )
     ),
     h(
@@ -4120,10 +5663,10 @@ var ROADMAP = [
     key: "notify",
     tone: "neutral",
     status: ["\u540E\u7EED", "Later"],
-    title: ["\u98DE\u4E66 / \u7CFB\u7EDF\u901A\u77E5", "Feishu / system notifications"],
+    title: ["\u7CFB\u7EDF\u901A\u77E5", "System notifications"],
     desc: [
-      "PR \u8D85\u65F6\u3001\u4F5C\u8005\u4FEE\u590D\u3001\u91CD\u65B0\u8BF7\u6C42\u5BA1\u67E5\u65F6\u63A8\u9001\uFF1B\u9700\u8981\u7F51\u7EDC\u4E0E\u901A\u77E5\u6743\u9650\u3002",
-      "Notify on overdue PRs, author fixes and re-review requests; needs network and notification permissions."
+      "\u98DE\u4E66\u6BCF\u5C0F\u65F6\u6C47\u603B\u5DF2\u5728\u300C\u81EA\u52A8\u5316\u300D\u91CC\u63D0\u4F9B\uFF1B\u7CFB\u7EDF\u901A\u77E5\uFF08PR \u8D85\u65F6\u3001\u4F5C\u8005\u4FEE\u590D\u65F6\u5373\u65F6\u5F39\u51FA\uFF09\u4ECD\u5728\u89C4\u5212\u3002",
+      "The hourly Feishu digest ships under Automation; instant system notifications are still planned."
     ]
   },
   {
@@ -4219,7 +5762,7 @@ function useSectionSpy(active, setActive) {
   };
   return { bodyRef, scrollTo, onScroll };
 }
-function SettingsBody({ t, ctx, store, index, rules, defs, counts: counts2, now, toast, onSync }) {
+function SettingsBody({ t, ctx, store, index, rules, defs, counts: counts2, now, toast, onSync, auto, digest }) {
   void ctx;
   void now;
   const [active, setActive] = React.useState("src");
@@ -4241,13 +5784,14 @@ function SettingsBody({ t, ctx, store, index, rules, defs, counts: counts2, now,
       h(BoardSection, shared),
       h(BadgeSection, shared),
       h(SyncSection, shared),
+      h(AutomationSection, { ...shared, auto, digest }),
       h(LocalSection, shared),
       h(RoadmapSection, { t }),
       h("div", { className: "ght-m-foot-note" }, t("\u540C\u4E00\u4EFD\u8BBE\u7F6E\u4E5F\u5728\u300C\u5BA2\u6237\u7AEF\u8BBE\u7F6E \u203A \u63D2\u4EF6 \u203A CCGUI \xB7 Git \u4EFB\u52A1\u7BA1\u7406\u300D", "The same settings live under Settings \u203A Plugins"))
     )
   );
 }
-function SettingsModal({ t, ctx, store, index, rules, defs, counts: counts2, now, toast, onClose, onSync }) {
+function SettingsModal({ t, ctx, store, index, rules, defs, counts: counts2, now, toast, onClose, onSync, auto, digest }) {
   return [
     h("div", { key: "scrim", className: "ght-mscrim", onClick: onClose }),
     h(
@@ -4260,8 +5804,8 @@ function SettingsModal({ t, ctx, store, index, rules, defs, counts: counts2, now
         h("span", { className: "ght-sp" }),
         h("button", { type: "button", className: "ght-icon-btn ght-bare", onClick: onClose, title: t("\u5173\u95ED\uFF08Esc\uFF09", "Close (Esc)") }, h(Icon, { name: "x", size: 15 }))
       ),
-      h(SettingsBody, { t, ctx, store, index, rules, defs, counts: counts2, now, toast, onSync }),
-      h("div", { className: "ght-m-foot" }, h("span", { className: "ght-m-note" }, t("\u53EA\u8BFB gh \xB7 \u4E0D\u5199 GitHub", "read-only gh \xB7 no writes")), h("span", { className: "ght-sp" }), h("button", { type: "button", className: "ght-btn ght-btn-pri", onClick: onClose }, t("\u5B8C\u6210", "Done")))
+      h(SettingsBody, { t, ctx, store, index, rules, defs, counts: counts2, now, toast, onSync, auto, digest }),
+      h("div", { className: "ght-m-foot" }, h("span", { className: "ght-m-note" }, t("\u53EA\u8BFB gh \xB7 \u4E0D\u5199 GitHub \xB7 \u98DE\u4E66\u6C47\u603B\u9700\u624B\u52A8\u5F00\u542F", "read-only gh \xB7 no GitHub writes \xB7 Feishu digest is opt-in")), h("span", { className: "ght-sp" }), h("button", { type: "button", className: "ght-btn ght-btn-pri", onClick: onClose }, t("\u5B8C\u6210", "Done")))
     )
   ];
 }
@@ -4330,12 +5874,16 @@ function CreatePreview({ t, pr, branch, repo }) {
     )
   );
 }
-function useCreateWorktree({ t, ctx, store, index, pr, repo, branch, toast, onClose }) {
+function useCreateWorktree({ t, ctx, store, index, auto, pr, repo, branch, toast, onClose }) {
   const [creating, setCreating] = React.useState(false);
   const [error, setError] = React.useState(null);
   const create = async () => {
     if (!repo) {
       setError(t("\u627E\u4E0D\u5230\u8FD9\u4E2A\u4ED3\u5E93\u5BF9\u5E94\u7684\u5DE5\u4F5C\u533A\uFF0C\u65E0\u6CD5\u521B\u5EFA", "No workspace found for this repository"));
+      return;
+    }
+    if (auto && !auto.claim(pr.key)) {
+      setError(t("\u63D2\u4EF6\u6B63\u5728\u4E3A\u8FD9\u4E2A PR \u81EA\u52A8\u521B\u5EFA worktree\uFF0C\u8BF7\u7A0D\u5019", "This PR's worktree is being created automatically"));
       return;
     }
     setCreating(true);
@@ -4349,8 +5897,7 @@ function useCreateWorktree({ t, ctx, store, index, pr, repo, branch, toast, onCl
         prTitle: pr.title,
         prUrl: pr.url
       });
-      const snapshot = await index.refresh();
-      const created = snapshot.worktrees.find((w) => w.path === result.worktreePath);
+      const created = await index.waitForWorktree(result.worktreePath);
       if (created) {
         store.bind(pr.key, created.workspaceId);
         store.markReviewing(pr.key, Date.now());
@@ -4361,6 +5908,7 @@ function useCreateWorktree({ t, ctx, store, index, pr, repo, branch, toast, onCl
       const message = err?.message || String(err);
       setError(t(`\u521B\u5EFA\u5931\u8D25\uFF1A${message}`, `Create failed: ${message}`));
     } finally {
+      if (auto) auto.release(pr.key);
       setCreating(false);
     }
   };
@@ -4429,9 +5977,10 @@ function useBindState({ pr, index, wts, prs, bindings, rules }) {
   const repo = index.getSnapshot().repos.find((r) => r.slug === pr.repoSlug);
   return { cands, firstFree, mode, setMode, pick, setPick, branch, repo };
 }
-function confirmBind({ store, cands, pick, pr, t, toast, onClose }) {
+function confirmBind({ store, auto, cands, pick, pr, t, toast, onClose }) {
   if (!pick) return;
   const candidate = cands.find((c) => c.wt.workspaceId === pick);
+  if (candidate?.wt.auto && auto) auto.adoptWorktree(pick);
   store.bind(pr.key, pick);
   store.markReviewing(pr.key, Date.now());
   toast(
@@ -4439,12 +5988,12 @@ function confirmBind({ store, cands, pick, pr, t, toast, onClose }) {
   );
   onClose();
 }
-function BindModal({ t, ctx, store, index, pr, wts, prs, bindings, rules, toast, onClose }) {
+function BindModal({ t, ctx, store, index, auto, pr, wts, prs, bindings, rules, toast, onClose }) {
   const { cands, firstFree, mode, setMode, pick, setPick, branch, repo } = useBindState({ pr, index, wts, prs, bindings, rules });
-  const creation = useCreateWorktree({ t, ctx, store, index, pr, repo, branch, toast, onClose });
+  const creation = useCreateWorktree({ t, ctx, store, index, auto, pr, repo, branch, toast, onClose });
   const confirm = () => {
     if (mode !== "bind") creation.create();
-    else confirmBind({ store, cands, pick, pr, t, toast, onClose });
+    else confirmBind({ store, auto, cands, pick, pr, t, toast, onClose });
   };
   return [
     h("div", { key: "scrim", className: "ght-mscrim", onClick: onClose }),
@@ -4483,6 +6032,61 @@ function BindModal({ t, ctx, store, index, pr, wts, prs, bindings, rules, toast,
   ];
 }
 
+// src/ui/AutoBanner.js
+function lines({ t, state, auto }) {
+  const out = [];
+  const info = auto.status();
+  if (info.breaker) {
+    out.push(["breaker", t("\u81EA\u52A8\u5EFA worktree \u8FDE\u7EED\u5931\u8D25\u5DF2\u7194\u65AD\uFF0C\u6BCF 30 \u5206\u949F\u8BD5\u63A2 1 \u4E2A", "Auto worktree creation paused after repeated failures")]);
+  }
+  if (info.capped) {
+    out.push([
+      "capped",
+      t(
+        `\u81EA\u52A8 worktree \u5DF2\u8FBE\u4E0A\u9650 ${state.cfg.automation.autoWorktreeMax} \u4E2A\uFF0C\u8FD8\u6709 ${info.waiting} \u4E2A\u5F85\u5BA1\u67E5 PR \u6CA1\u5EFA`,
+        `Auto worktree limit (${state.cfg.automation.autoWorktreeMax}) reached; ${info.waiting} PRs waiting`
+      )
+    ]);
+  }
+  const cleanable = auto.cleanable().length;
+  if (cleanable) {
+    out.push(["clean", t(`${cleanable} \u4E2A\u81EA\u52A8 worktree \u5BF9\u5E94\u7684 PR \u5DF2\u7ED3\u675F\uFF0C\u53EF\u4EE5\u6E05\u7406`, `${cleanable} auto worktrees belong to ended PRs`)]);
+  }
+  if (state.cfg.notify.feishu && state.notify.paused) {
+    out.push(["notify", t(`\u98DE\u4E66\u6C47\u603B\u5DF2\u6682\u505C\uFF1A${state.notify.paused.message}`, `Feishu digest paused: ${state.notify.paused.message}`)]);
+  }
+  return out;
+}
+function AutoBanner({ t, store, state, auto, onOpenSettings }) {
+  if (!auto) return null;
+  const items = lines({ t, state, auto });
+  const signature = items.map(([key, text2]) => `${key}:${text2}`).join("|");
+  if (!items.length || state.ui.autoBannerHidden === signature) return null;
+  return h(
+    "div",
+    { className: "ght-banner ght-banner-list ght-banner-info" },
+    items.map(
+      ([key, text2], i) => h(
+        "div",
+        { key, className: "ght-banner-row" },
+        h("span", { className: "ght-banner-text" }, text2),
+        h("button", { type: "button", className: "ght-linkish", onClick: onOpenSettings }, t("\u53BB\u8BBE\u7F6E", "Settings")),
+        i === 0 ? h(
+          "button",
+          {
+            type: "button",
+            className: "ght-banner-close",
+            title: t("\u5173\u95ED", "Dismiss"),
+            "aria-label": t("\u5173\u95ED", "Dismiss"),
+            onClick: () => store.setUi({ autoBannerHidden: signature })
+          },
+          h(Icon, { name: "x", size: 13 })
+        ) : null
+      )
+    )
+  );
+}
+
 // src/ui/Panel.js
 var FILTERS = [
   ["all", "\u5168\u90E8", "All"],
@@ -4518,31 +6122,17 @@ function useToast() {
 }
 function useTrackedRows(store, index, now) {
   const state = useStore(store);
-  const workspaces = useStore(index);
-  const repoIndexMap = React.useMemo(
-    () => new Map(state.cfg.repos.map((r, i) => [r.slug, i])),
-    [state.cfg.repos]
+  const indexSnap = useStore(index);
+  const workspaces = React.useMemo(
+    () => ({ ...indexSnap, worktrees: autoFlags(indexSnap.worktrees, state.auto) }),
+    [indexSnap, state.auto]
   );
-  const ignoredSet = React.useMemo(() => new Set(state.local.ignored), [state.local.ignored]);
-  const prs = React.useMemo(() => {
-    const ignored = ignoredSet;
-    return store.allPrs().map((pr) => ({
-      ...pr,
-      ignored: ignored.has(pr.key),
-      repoIndex: repoIndexMap.get(pr.repoSlug) ?? 0
-    }));
-  }, [state.snapshots, state.local.marks, ignoredSet, repoIndexMap, store]);
-  const meSet = React.useMemo(
-    () => new Set(
-      [state.runtime.ghLogin, ...state.cfg.extraAccounts].filter(Boolean).map((v) => String(v).toLowerCase())
-    ),
-    [state.runtime.ghLogin, state.cfg.extraAccounts]
+  const prs = React.useMemo(
+    () => decoratedPrs(state, store.allPrs()),
+    [state.snapshots, state.local.marks, state.local.ignored, state.cfg.repos, store]
   );
-  const reposEnabled = React.useMemo(() => {
-    const map = {};
-    for (const repo of state.cfg.repos) map[repo.slug] = repo.enabled && repo.available !== false;
-    return map;
-  }, [state.cfg.repos]);
+  const meSet = React.useMemo(() => meSetOf(state), [state.runtime.ghLogin, state.cfg.extraAccounts]);
+  const reposEnabled = React.useMemo(() => reposEnabledOf(state), [state.cfg.repos]);
   const rows = React.useMemo(
     () => selectRows(prs, {
       rules: state.cfg.rules,
@@ -4598,14 +6188,14 @@ function usePanelActions({ store, exec, sync, showToast, t }) {
       openPr: (key) => store.setUi({ drawerKey: key, modal: null }),
       openBind: (key) => store.setUi({ modal: { type: "bind", prKey: key } }),
       onWorktree: (wt) => {
-        const text = wt.path || "";
+        const text2 = wt.path || "";
         if (navigator.clipboard?.writeText) {
-          navigator.clipboard.writeText(text).then(
-            () => showToast(t(`\u5DF2\u590D\u5236\u8DEF\u5F84\uFF1A${text}`, `Path copied: ${text}`)),
-            () => showToast(text)
+          navigator.clipboard.writeText(text2).then(
+            () => showToast(t(`\u5DF2\u590D\u5236\u8DEF\u5F84\uFF1A${text2}`, `Path copied: ${text2}`)),
+            () => showToast(text2)
           );
         } else {
-          showToast(text);
+          showToast(text2);
         }
       },
       dismissError: (slug) => {
@@ -4718,7 +6308,7 @@ function nextRepoFilter(state, enabledRepos, slug) {
   const ordered = all.filter((s) => next.includes(s));
   return !ordered.length || ordered.length === all.length ? "all" : ordered;
 }
-function PanelContent({ t, store, model }) {
+function PanelContent({ t, store, model, auto }) {
   const { state, rows, enabledRepos, selectedSlugs, now, actions, c, flow, chart, flows, workspaces, prs, filterFn, showToast } = model;
   const scroller = useScrollMemory(`panel:${state.ui.view}`);
   return h(
@@ -4741,6 +6331,7 @@ function PanelContent({ t, store, model }) {
         onOpenSettings: () => store.setUi({ modal: "settings" }),
         onPickRepo: (slug) => store.setUi({ repoFilter: nextRepoFilter(state, enabledRepos, slug) })
       }),
+      h(AutoBanner, { t, store, state, auto, onOpenSettings: () => store.setUi({ modal: "settings" }) }),
       h(Kpis, {
         t,
         c,
@@ -4770,18 +6361,20 @@ function PanelContent({ t, store, model }) {
     )
   );
 }
-function createPanel({ ctx, t, store, index, exec, sync }) {
+function createPanel({ ctx, t, store, index, exec, sync, auto, digest }) {
   function Panel() {
     const model = usePanelModel({ store, index, exec, sync, t });
     return h(
       "div",
       { className: "ght-root" },
-      h(PanelContent, { t, store, model }),
+      h(PanelContent, { t, store, model, auto }),
       h(Overlays, {
         t,
         ctx,
         store,
         index,
+        auto,
+        digest,
         state: model.state,
         now: model.now,
         prs: model.prs,
@@ -4796,7 +6389,7 @@ function createPanel({ ctx, t, store, index, exec, sync }) {
   }
   return Panel;
 }
-function DrawerLayer({ t, ctx, store, index, state, now, prs, workspaces, selectedPr, showToast, actions }) {
+function DrawerLayer({ t, ctx, store, index, auto, state, now, prs, workspaces, selectedPr, showToast, actions }) {
   if (!selectedPr) return null;
   return h(Drawer, {
     t,
@@ -4815,10 +6408,12 @@ function DrawerLayer({ t, ctx, store, index, state, now, prs, workspaces, select
     onGh: actions.ghOpen,
     onRefresh: () => actions.refreshPr(selectedPr),
     onBind: actions.openBind,
-    onWorktree: actions.onWorktree
+    onWorktree: actions.onWorktree,
+    onAdopt: auto ? (key) => auto.adopt(key) : null,
+    checkDirty: auto ? (path) => auto.isDirty(path) : null
   });
 }
-function SettingsLayer({ t, ctx, store, index, state, now, counts: counts2, showToast, actions }) {
+function SettingsLayer({ t, ctx, store, index, auto, digest, state, now, counts: counts2, showToast, actions }) {
   if (state.ui.modal !== "settings") return null;
   return h(SettingsModal, {
     t,
@@ -4831,10 +6426,12 @@ function SettingsLayer({ t, ctx, store, index, state, now, counts: counts2, show
     now,
     toast: showToast,
     onSync: actions.syncNow,
-    onClose: () => store.setUi({ modal: null, drawerKey: null })
+    onClose: () => store.setUi({ modal: null, drawerKey: null }),
+    auto,
+    digest
   });
 }
-function BindLayer({ t, ctx, store, index, state, prs, workspaces, showToast }) {
+function BindLayer({ t, ctx, store, index, auto, state, prs, workspaces, showToast }) {
   const bindPr = state.ui.modal?.prKey ? prs.find((p) => p.key === state.ui.modal.prKey) : null;
   if (state.ui.modal?.type !== "bind" || !bindPr) return null;
   return h(BindModal, {
@@ -4848,16 +6445,17 @@ function BindLayer({ t, ctx, store, index, state, prs, workspaces, showToast }) 
     bindings: state.local.bindings,
     rules: state.cfg.rules,
     toast: showToast,
+    auto,
     onClose: () => store.setUi({ modal: null, drawerKey: null })
   });
 }
-function Overlays({ t, ctx, store, index, state, now, prs, workspaces, selectedPr, counts: counts2, toast, showToast, actions }) {
+function Overlays({ t, ctx, store, index, auto, digest, state, now, prs, workspaces, selectedPr, counts: counts2, toast, showToast, actions }) {
   return h(
     React.Fragment,
     null,
-    h(DrawerLayer, { t, ctx, store, index, state, now, prs, workspaces, selectedPr, showToast, actions }),
-    h(SettingsLayer, { t, ctx, store, index, state, now, counts: counts2, showToast, actions }),
-    h(BindLayer, { t, ctx, store, index, state, prs, workspaces, showToast }),
+    h(DrawerLayer, { t, ctx, store, index, auto, state, now, prs, workspaces, selectedPr, showToast, actions }),
+    h(SettingsLayer, { t, ctx, store, index, auto, digest, state, now, counts: counts2, showToast, actions }),
+    h(BindLayer, { t, ctx, store, index, auto, state, prs, workspaces, showToast }),
     h(Toast, { toast, t })
   );
 }
@@ -4947,7 +6545,7 @@ function PanelHeader({ t, state, rows, enabledRepos, selectedSlugs, now, onSync,
   );
 }
 function RepoMenu({ t, state, rows, enabledRepos, current, onPick }) {
-  const openCount = (slug) => rows.filter((r) => r.pr.repoSlug === slug && state.cfg.defs[r.d.key].owner !== "done").length;
+  const openCount2 = (slug) => rows.filter((r) => r.pr.repoSlug === slug && state.cfg.defs[r.d.key].owner !== "done").length;
   return h(
     "div",
     { className: "ght-repo-menu" },
@@ -4973,7 +6571,7 @@ function RepoMenu({ t, state, rows, enabledRepos, current, onPick }) {
         },
         h(RepoDot, { index: state.cfg.repos.findIndex((r) => r.slug === repo.slug) }),
         h("span", { className: "ght-repo-name", title: repo.slug }, repo.slug),
-        h("small", null, t(`${openCount(repo.slug)} \u8FDB\u884C\u4E2D`, `${openCount(repo.slug)} open`))
+        h("small", null, t(`${openCount2(repo.slug)} \u8FDB\u884C\u4E2D`, `${openCount2(repo.slug)} open`))
       )
     )
   );
@@ -5233,33 +6831,7 @@ function TodayFlow({ t, flow, defs, rules }) {
 
 // src/main.js
 var ICON_PATHS = '<circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M6 21V9a9 9 0 0 0 9 9"/>';
-function decorate(store) {
-  const state = store.getSnapshot();
-  const repoIndexMap = new Map(state.cfg.repos.map((r, i) => [r.slug, i]));
-  const ignored = new Set(state.local.ignored);
-  return store.allPrs().map((pr) => ({
-    ...pr,
-    ignored: ignored.has(pr.key),
-    repoIndex: repoIndexMap.get(pr.repoSlug) ?? 0
-  }));
-}
-function rowsOf(store, index) {
-  const state = store.getSnapshot();
-  const reposEnabled = {};
-  for (const repo of state.cfg.repos) reposEnabled[repo.slug] = repo.enabled && repo.available !== false;
-  const meSet = new Set(
-    [state.runtime.ghLogin, ...state.cfg.extraAccounts].filter(Boolean).map((v) => String(v).toLowerCase())
-  );
-  return selectRows(decorate(store), {
-    rules: state.cfg.rules,
-    meSet,
-    reposEnabled,
-    wts: index.getSnapshot().worktrees,
-    bindings: state.local.bindings,
-    reviewingSince: state.local.reviewing,
-    now: Date.now()
-  });
-}
+var rowsOf = (store, index) => trackedRows(store, index).rows;
 function navCountOf(store, index) {
   const state = store.getSnapshot();
   if (!state.cfg.rules.navCount) return null;
@@ -5293,8 +6865,19 @@ function createRuntime(ctx, t) {
   });
   const index = createWorkspaceIndex({ ctx, exec, store });
   const badges = createBadges({ ctx, store, index, exec, t });
-  const sync = createSync({ exec, store, onAfter: () => badges.refresh() });
-  return { exec, store, index, badges, sync };
+  const automation = {};
+  const sync = createSync({
+    exec,
+    store,
+    onAfter: () => {
+      badges.refresh();
+      automation.auto?.run().catch(() => void 0);
+      automation.digest?.check();
+    }
+  });
+  automation.auto = createAutoWorktree({ ctx, store, index, exec });
+  automation.digest = createDigest({ ctx, store, index, sync, t });
+  return { exec, store, index, badges, sync, auto: automation.auto, digest: automation.digest };
 }
 function useEmbeddedToast() {
   const [toast, setToast] = React.useState(null);
@@ -5307,7 +6890,7 @@ function useEmbeddedToast() {
   React.useEffect(() => () => clearTimeout(timer.current), []);
   return [toast, show];
 }
-function createSettingsSection({ ctx, t, store, index, sync }) {
+function createSettingsSection({ ctx, t, store, index, sync, auto, digest }) {
   return function SettingsSection() {
     const state = useStore(store);
     useStore(index);
@@ -5330,6 +6913,8 @@ function createSettingsSection({ ctx, t, store, index, sync }) {
         counts: c,
         now: Date.now(),
         toast: show,
+        auto,
+        digest,
         onSync: () => {
           sync.run();
         }
@@ -5338,7 +6923,7 @@ function createSettingsSection({ ctx, t, store, index, sync }) {
     );
   };
 }
-function registerSurfaces(ctx, { t, store, index, sync, Panel }) {
+function registerSurfaces(ctx, { t, store, index, sync, auto, digest, Panel }) {
   const openPanel = () => {
     try {
       ctx.ui.openCenterTab("board");
@@ -5385,11 +6970,11 @@ function registerSurfaces(ctx, { t, store, index, sync, Panel }) {
   ctx.ui.registerSettingsSection({
     key: "settings",
     label: () => t("Git \u4EFB\u52A1\u7BA1\u7406", "Git Tasks"),
-    component: createSettingsSection({ ctx, t, store, index, sync })
+    component: createSettingsSection({ ctx, t, store, index, sync, auto, digest })
   });
   return { openPanel, registerNav };
 }
-function bootstrap({ ctx, store, index, badges, registerNav, startScheduler, sync, isDisposed }) {
+function bootstrap({ ctx, store, index, badges, registerNav, startScheduler, sync, digest, isDisposed }) {
   return (async () => {
     await store.init();
     const cachedViewer = await ctx.storage.get("viewer").catch(() => null);
@@ -5399,6 +6984,7 @@ function bootstrap({ ctx, store, index, badges, registerNav, startScheduler, syn
     badges.refresh();
     registerNav();
     startScheduler();
+    digest.start();
     const result = await sync.run();
     if (result?.login) {
       ctx.storage.set("viewer", { v: 1, login: result.login }).catch(() => void 0);
@@ -5419,7 +7005,7 @@ function createLiveScheduler({ store, sync }) {
   };
   return { scheduler, start, scheduled: () => scheduledInterval };
 }
-function installWatchers({ ctx, store, index, badges, registerNav, live }) {
+function installWatchers({ ctx, store, index, badges, auto, digest, registerNav, live }) {
   let lastNav = navCountOf(store, index);
   const syncNav = () => {
     const value = navCountOf(store, index);
@@ -5428,7 +7014,9 @@ function installWatchers({ ctx, store, index, badges, registerNav, live }) {
     registerNav();
   };
   const onVisibility = () => {
-    if (document.visibilityState === "visible") live.scheduler.wake();
+    if (document.visibilityState !== "visible") return;
+    live.scheduler.wake();
+    digest.check();
   };
   const onStoreChange = () => {
     badges.refresh();
@@ -5441,7 +7029,11 @@ function installWatchers({ ctx, store, index, badges, registerNav, live }) {
     }
   };
   document.addEventListener("visibilitychange", onVisibility);
-  const offs = [store.subscribe(onStoreChange), index.subscribe(() => badges.refresh())];
+  const onIndexChange = () => {
+    auto.reconcile();
+    badges.refresh();
+  };
+  const offs = [store.subscribe(onStoreChange), index.subscribe(onIndexChange)];
   return {
     setLastNav: (value) => {
       lastNav = value;
@@ -5452,10 +7044,10 @@ function installWatchers({ ctx, store, index, badges, registerNav, live }) {
     }
   };
 }
-function startLifecycle(ctx, { store, index, badges, sync, registerNav }) {
+function startLifecycle(ctx, { store, index, badges, sync, auto, digest, registerNav }) {
   let disposed = false;
   const live = createLiveScheduler({ store, sync });
-  const watchers = installWatchers({ ctx, store, index, badges, registerNav, live });
+  const watchers = installWatchers({ ctx, store, index, badges, auto, digest, registerNav, live });
   bootstrap({
     ctx,
     store,
@@ -5466,11 +7058,14 @@ function startLifecycle(ctx, { store, index, badges, sync, registerNav }) {
     },
     startScheduler: live.start,
     sync,
+    digest,
     isDisposed: () => disposed
   });
   return () => {
     disposed = true;
     live.scheduler.stop();
+    auto.dispose();
+    digest.dispose();
     badges.dispose();
     watchers.off();
     store.flush();
@@ -5491,7 +7086,16 @@ function activate(ctx) {
   bindReact(ctx.react);
   const t = createT(ctx.host?.locale);
   const runtime = createRuntime(ctx, t);
-  const Panel = createPanel({ ctx, t, store: runtime.store, index: runtime.index, exec: runtime.exec, sync: runtime.sync });
+  const Panel = createPanel({
+    ctx,
+    t,
+    store: runtime.store,
+    index: runtime.index,
+    exec: runtime.exec,
+    sync: runtime.sync,
+    auto: runtime.auto,
+    digest: runtime.digest
+  });
   const surfaces = registerSurfaces(ctx, { t, ...runtime, Panel });
   return startLifecycle(ctx, { ...runtime, registerNav: surfaces.registerNav });
 }

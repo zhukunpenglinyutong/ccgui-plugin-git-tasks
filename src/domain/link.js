@@ -35,6 +35,7 @@ export function wtFor(pr, { wts, prs, bindings, rules }) {
 }
 
 export function linkSource(wt, pr, bindings) {
+  if (wt.auto) return "插件自动创建（未开始审查）";
   if (bindings[pr.key] === wt.workspaceId) return "你手动绑定";
   if (wt.prNumber === pr.number) return "客户端从 PR 创建";
   return "分支名与 PR 一致";

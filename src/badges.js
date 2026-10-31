@@ -4,6 +4,7 @@
 import { derive, flags } from "./domain/derive.js";
 import { linkPr, linkSource, reviewingState } from "./domain/link.js";
 import { duration, nextStep, prUrl } from "./domain/text.js";
+import { worktreesOf } from "./rows.js";
 
 /** 徽标预算只有 6 码点（宿主截断）；时长用 2–3 字符的紧凑写法。 */
 export function compactAge(ms) {
@@ -23,11 +24,11 @@ export function composeBadgeLabel(label, age) {
   return [...withDot].slice(0, 6).join("");
 }
 
-function badgeTip(wt, pr, def, d, rules, bindings, t) {
-  const age = duration(Date.now() - d.since, t);
+function badgeTip(wt, pr, def, d, rules, bindings, t, now) {
+  const age = duration(now - d.since, t);
   return [
     `${pr.repoSlug} #${pr.number} · ${def.label}${d.reviews ? ` · ${t(`已审 ${d.reviews} 次`, `reviewed ${d.reviews}×`)}` : ""}`,
-    nextStep(pr, d, rules, Date.now(), t).plain,
+    nextStep(pr, d, rules, now, t).plain,
     t(`停留 ${age} · 对应方式：${linkSource(wt, pr, bindings)}`, `for ${age} · linked by: ${linkSource(wt, pr, bindings)}`),
     rules.badgeClick === "detail"
       ? t("点击查看流转详情", "click to open details")
@@ -35,27 +36,27 @@ function badgeTip(wt, pr, def, d, rules, bindings, t) {
   ].join("\n");
 }
 
-export function badgeForWorktree({ state, wt, pr, t }) {
+export function badgeForWorktree({ state, wt, pr, t, now = Date.now() }) {
   const rules = state.cfg.rules;
   if (!rules.badgeEnabled || !pr || pr.ignored) return null;
   const repo = state.cfg.repos.find((r) => r.slug === pr.repoSlug);
   if (!repo || repo.enabled === false) return null;
-  const d = reviewingState(derive(pr, rules), true, state.local.reviewing[pr.key]);
+  // 插件自动建、还没开始审查的 worktree 显示 PR 的原始状态（待审查），不算审查中。
+  const d = reviewingState(derive(pr, rules), !wt.auto, state.local.reviewing[pr.key]);
   const def = state.cfg.defs[d.key];
   if (!def?.badge) return null;
-  const f = flags(d, rules, Date.now());
+  const f = flags(d, rules, now);
   const showAge = rules.badgeAge === "always" || (rules.badgeAge === "overdue" && (f.overdue || f.silent));
-  const age = duration(Date.now() - d.since, t);
   const label =
-    showAge && def.owner !== "done" ? composeBadgeLabel(def.label, compactAge(Date.now() - d.since)) : def.label;
+    showAge && def.owner !== "done" ? composeBadgeLabel(def.label, compactAge(now - d.since)) : def.label;
   return {
     label,
     tone: def.tone,
-    tooltip: badgeTip(wt, pr, def, d, rules, state.local.bindings, t),
+    tooltip: badgeTip(wt, pr, def, d, rules, state.local.bindings, t, now),
   };
 }
 
-function buildPayload({ state, worktrees, prs, t }) {
+function buildPayload({ state, worktrees, prs, t, now }) {
   return worktrees.map((wt) => [
     wt.workspaceId,
     badgeForWorktree({
@@ -63,6 +64,7 @@ function buildPayload({ state, worktrees, prs, t }) {
       wt,
       pr: linkPr(wt, { prs, bindings: state.local.bindings, rules: state.cfg.rules }),
       t,
+      now,
     }),
   ]);
 }
@@ -85,7 +87,7 @@ function openWorktreePr({ ctx, store, index, exec, target }) {
   }
 }
 
-export function createBadges({ ctx, store, index, exec, t }) {
+export function createBadges({ ctx, store, index, exec, t, now = Date.now }) {
   const supported = typeof ctx.ui.registerWorktreeBadges === "function";
   let handle = null;
   let known = new Set();
@@ -111,19 +113,20 @@ export function createBadges({ ctx, store, index, exec, t }) {
     const state = store.getSnapshot();
     const ignored = new Set(state.local.ignored);
     const prs = store.allPrs().map((pr) => (ignored.has(pr.key) ? { ...pr, ignored: true } : pr));
-    const worktrees = index.getSnapshot().worktrees;
+    const worktrees = worktreesOf(store, index);
     // 已有 worktree 但没记过审查开始时间（宿主侧创建 / 历史数据）：补一个，
     // 否则徽标会把 PR 的等待时长误显示成审查时长。写入后由 store 通知重入。
     const missing = [];
     for (const wt of worktrees) {
+      if (wt.auto) continue;
       const pr = linkPr(wt, { prs, bindings: state.local.bindings, rules: state.cfg.rules });
       if (!pr || state.local.reviewing[pr.key]) continue;
       if (derive(pr, state.cfg.rules).key === "needs_review") missing.push(pr.key);
     }
     if (missing.length) {
-      for (const key of missing) store.markReviewing(key, Date.now());
+      for (const key of missing) store.markReviewing(key, now());
     }
-    const payload = buildPayload({ state, worktrees, prs, t });
+    const payload = buildPayload({ state, worktrees, prs, t, now: now() });
     const serialized = JSON.stringify(payload);
     if (serialized === lastSerialized) return;
     lastSerialized = serialized;

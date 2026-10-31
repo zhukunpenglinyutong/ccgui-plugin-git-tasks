@@ -118,3 +118,33 @@ export const GIT_TIMEOUT_MS = 15_000;
 // 本机链路对并发 GraphQL 连接敏感：默认串行，避免 EOF。
 export const GH_CONCURRENCY = 1;
 export const DEFAULT_REMOTE = "origin";
+
+/** 自动化：自动建 worktree。上限可配（1–50），每轮同步最多新建 AUTO_WT_PER_RUN 个，
+ *  避免侧栏一次刷出几十条创建进度。 */
+export const DEFAULT_AUTOMATION = {
+  autoWorktree: false,
+  autoWorktreeMax: 10,
+  // fork 来的 PR 任何人都能提；自动检出会触发本机 git 钩子（husky 等），默认不建。
+  autoWorktreeForks: false,
+};
+export const AUTO_WT_MAX_LIMIT = 50;
+export const AUTO_WT_PER_RUN = 5;
+// 宿主每次失败都会在侧栏留一条可重试的失败行：自动重试次数要克制。
+export const AUTO_WT_MAX_ATTEMPTS = 2;
+export const AUTO_WT_RETRY_MS = 30 * MINUTE;
+// 连续这么多次「暂时性失败」就熔断；熔断期间每 AUTO_WT_RETRY_MS 只试探 1 个，成功才恢复。
+export const AUTO_WT_BREAKER = 3;
+// 侧栏里暂时看不到某个自动 worktree（刷新乱序 / 侧栏重排）时，等这么久仍不见才判为被删。
+export const AUTO_WT_MISSING_GRACE_MS = 10 * MINUTE;
+
+/** 自动化：飞书每小时汇总。静默时段内不发，攒到静默结束后合并成一条。 */
+export const DEFAULT_NOTIFY = {
+  feishu: false,
+  quiet: true,
+  quietStart: 22,
+  quietEnd: 8,
+};
+// 飞书自定义机器人请求体上限约 20KB，留余量。
+export const FEISHU_MAX_BYTES = 18_000;
+export const DIGEST_CHANGES_PER_REPO = 15;
+export const DIGEST_TICK_MS = MINUTE;

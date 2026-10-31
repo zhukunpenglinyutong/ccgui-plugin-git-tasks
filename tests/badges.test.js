@@ -47,7 +47,8 @@ function harness({ supported = true } = {}) {
     refresh: async () => ({ worktrees }),
   };
   const t = createT("zh-CN");
-  return { ctx, exec, store, index, sets, opened, t, click: () => clickHandler, worktrees };
+  // 固定时钟：徽标的停留时长 / 超时后缀依赖“现在”，不能随真实日期漂移。
+  return { ctx, exec, store, index, sets, opened, t, now: () => NOW, click: () => clickHandler, worktrees };
 }
 
 async function seed(store, pr) {
@@ -177,4 +178,18 @@ test("徽标预算：默认名与“名称·时长”都落在宿主 6 码点内
   assert.ok([...composeBadgeLabel("待复审", "12h")].length <= 6);
   assert.ok([...composeBadgeLabel("Re", "12h")].length <= 6);
   assert.ok([...composeBadgeLabel("Merge", "2d")].length <= 6);
+});
+
+test("自动建的 worktree：徽标显示待审查，不记审查开始时间", async () => {
+  const harnessed = harness();
+  await seed(harnessed.store, makePr({ number: 1, repo: "desktop", owner: "acme", createdAt: NOW - 3600_000 }));
+  harnessed.store.setAutoRecord("acme/desktop#1", { status: "created", workspaceId: "wt-1", attempts: 1, at: NOW });
+  const badges = createBadges(harnessed);
+  badges.refresh();
+  const [id, badge] = harnessed.sets.at(-1);
+  assert.equal(id, "wt-1");
+  assert.equal(badge.label, "待审查");
+  assert.match(badge.tooltip, /插件自动创建/);
+  assert.equal(harnessed.store.getSnapshot().local.reviewing["acme/desktop#1"], undefined);
+  badges.dispose();
 });

@@ -26,6 +26,8 @@ globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 const { bindReact } = await import("../src/ui/react.js");
 const { createPanel } = await import("../src/ui/Panel.js");
 const { SettingsBody } = await import("../src/ui/SettingsModal.js");
+const { createAutoWorktree } = await import("../src/automation/autoWorktree.js");
+const { createDigest } = await import("../src/automation/digest.js");
 const { createStore } = await import("../src/store.js");
 const { createWorkspaceIndex } = await import("../src/workspaces.js");
 const { fetchRepo } = await import("../src/sync.js");
@@ -138,6 +140,8 @@ async function mount() {
       return { number: Number(String(key).split("#")[1]), state: "MERGED" };
     },
   };
+  const auto = createAutoWorktree({ ctx, store, index, exec });
+  const digest = createDigest({ ctx, store, index, sync, t: createT("zh-CN") });
   const Panel = createPanel({
     ctx,
     t: createT("zh-CN"),
@@ -145,6 +149,8 @@ async function mount() {
     index,
     exec,
     sync,
+    auto,
+    digest,
   });
   const container = document.createElement("div");
   document.body.appendChild(container);
@@ -221,7 +227,7 @@ test("设置弹窗打开、切换分区、关闭", async () => {
   await act(async () => gear.click());
   assert.ok(container.querySelector(".ght-set-modal"));
   const nav = [...container.querySelectorAll(".ght-m-nav button")];
-  assert.equal(nav.length, 10);
+  assert.equal(nav.length, 11);
   await act(async () => nav.find((b) => b.textContent === "Worktree 徽标").click());
   assert.match(container.querySelector(".ght-m-body").textContent, /点击徽标/);
   await act(async () => [...container.querySelectorAll(".ght-m-nav button")].find((b) => b.textContent === "路线图").click());
@@ -384,5 +390,63 @@ test("设置分区组件可单独渲染（客户端设置 › 插件）", async 
   });
   assert.ok(container.querySelectorAll("[data-sec]").length === 10);
   assert.ok(container.querySelector(".ght-repo-line"));
+  await act(async () => root.unmount());
+});
+
+test("设置 › 自动化：开关自动建 worktree；没填 webhook 时飞书开关与测试按钮不可用", async () => {
+  const { root, container, store } = await mount();
+  const gear = [...container.querySelectorAll(".ght-icon-btn")].at(-1);
+  await act(async () => gear.click());
+  await act(async () => [...container.querySelectorAll(".ght-m-nav button")].find((b) => b.textContent === "自动化").click());
+  const sec = container.querySelector('[data-sec="auto"]');
+  assert.ok(sec, "自动化分区应渲染");
+  assert.match(sec.textContent, /自动创建 worktree/);
+  assert.match(sec.textContent, /飞书每小时汇总/);
+  assert.match(sec.textContent, /先填写下面的 webhook 地址/);
+  const toggle = sec.querySelector('label[aria-label="autoWorktree"] input');
+  await act(async () => toggle.click());
+  assert.equal(store.getSnapshot().cfg.automation.autoWorktree, true);
+  const feishu = sec.querySelector('label[aria-label="feishu"] input');
+  await act(async () => feishu.click());
+  assert.equal(store.getSnapshot().cfg.notify.feishu, false, "没有合法 webhook 时不能开启");
+  const testBtn = [...sec.querySelectorAll("button")].find((b) => b.textContent === "发送测试消息");
+  assert.equal(testBtn.disabled, true);
+  await act(async () => root.unmount());
+});
+
+test("自动化横幅：飞书暂停时提示、可去设置、可关闭", async () => {
+  const { root, container, store } = await mount();
+  assert.equal(container.querySelector(".ght-banner-info"), null, "默认没有横幅");
+  await act(async () => {
+    store.setFeishu({ webhook: "https://open.feishu.cn/open-apis/bot/v2/hook/1b2c3d4e-aaaa" });
+    store.setNotifyCfg({ feishu: true });
+    store.setNotifyState({ paused: { kind: "sign", message: "飞书签名校验失败", at: 0 } });
+  });
+  const banner = container.querySelector(".ght-banner-info");
+  assert.ok(banner);
+  assert.match(banner.textContent, /飞书汇总已暂停：飞书签名校验失败/);
+  await act(async () => [...banner.querySelectorAll("button")].find((b) => b.textContent === "去设置").click());
+  assert.equal(store.getSnapshot().ui.modal, "settings");
+  await act(async () => store.setUi({ modal: null }));
+  await act(async () => container.querySelector(".ght-banner-info .ght-banner-close").click());
+  assert.equal(container.querySelector(".ght-banner-info"), null, "关闭后本次会话不再显示");
+  await act(async () => root.unmount());
+});
+
+test("设置 › 自动化：点「执行」有反馈；全是 fork 的 PR 时说明原因", async () => {
+  const { root, container, store } = await mount();
+  const gear = [...container.querySelectorAll(".ght-icon-btn")].at(-1);
+  await act(async () => gear.click());
+  await act(async () => store.setAutomation({ autoWorktree: true }));
+  const sec = container.querySelector('[data-sec="auto"]');
+  assert.match(sec.textContent, /待审查 \d+ 个/);
+  const run = [...sec.querySelectorAll("button")].find((b) => b.textContent === "执行");
+  await act(async () => {
+    run.click();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  });
+  const toast = container.querySelector(".ght-toast");
+  assert.ok(toast, "点了要有提示");
+  assert.match(toast.textContent, /fork/);
   await act(async () => root.unmount());
 });

@@ -1,13 +1,16 @@
 /** github-tasks · Tier-1 入口：组装 store / 数据层 / 领域层 / UI。 */
 
 import { DEFAULT_DEFS } from "./constants.js";
+import { createAutoWorktree } from "./automation/autoWorktree.js";
+import { createDigest } from "./automation/digest.js";
 import { createBadges } from "./badges.js";
 import { createExec } from "./gh/exec.js";
 import { createT, isEnglish, DEFAULT_DEFS_EN } from "./i18n.js";
 import { createStore } from "./store.js";
 import { createSync, createScheduler } from "./sync.js";
 import { createWorkspaceIndex } from "./workspaces.js";
-import { counts, selectRows } from "./domain/stats.js";
+import { counts } from "./domain/stats.js";
+import { trackedRows } from "./rows.js";
 import { bindReact, React } from "./ui/react.js";
 import { h, useStore } from "./ui/common.js";
 import { createPanel } from "./ui/Panel.js";
@@ -16,36 +19,7 @@ import { SettingsBody } from "./ui/SettingsModal.js";
 const ICON_PATHS =
   '<circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M6 21V9a9 9 0 0 0 9 9"/>';
 
-function decorate(store) {
-  const state = store.getSnapshot();
-  const repoIndexMap = new Map(state.cfg.repos.map((r, i) => [r.slug, i]));
-  const ignored = new Set(state.local.ignored);
-  return store.allPrs().map((pr) => ({
-    ...pr,
-    ignored: ignored.has(pr.key),
-    repoIndex: repoIndexMap.get(pr.repoSlug) ?? 0,
-  }));
-}
-
-function rowsOf(store, index) {
-  const state = store.getSnapshot();
-  const reposEnabled = {};
-  for (const repo of state.cfg.repos) reposEnabled[repo.slug] = repo.enabled && repo.available !== false;
-  const meSet = new Set(
-    [state.runtime.ghLogin, ...state.cfg.extraAccounts]
-      .filter(Boolean)
-      .map((v) => String(v).toLowerCase()),
-  );
-  return selectRows(decorate(store), {
-    rules: state.cfg.rules,
-    meSet,
-    reposEnabled,
-    wts: index.getSnapshot().worktrees,
-    bindings: state.local.bindings,
-    reviewingSince: state.local.reviewing,
-    now: Date.now(),
-  });
-}
+const rowsOf = (store, index) => trackedRows(store, index).rows;
 
 function navCountOf(store, index) {
   const state = store.getSnapshot();
@@ -82,8 +56,20 @@ function createRuntime(ctx, t) {
   });
   const index = createWorkspaceIndex({ ctx, exec, store });
   const badges = createBadges({ ctx, store, index, exec, t });
-  const sync = createSync({ exec, store, onAfter: () => badges.refresh() });
-  return { exec, store, index, badges, sync };
+  const automation = {};
+  const sync = createSync({
+    exec,
+    store,
+    onAfter: () => {
+      badges.refresh();
+      // 自动化都以“刚同步完的数据”为准：先建 worktree，再看要不要发汇总。
+      automation.auto?.run().catch(() => undefined);
+      automation.digest?.check();
+    },
+  });
+  automation.auto = createAutoWorktree({ ctx, store, index, exec });
+  automation.digest = createDigest({ ctx, store, index, sync, t });
+  return { exec, store, index, badges, sync, auto: automation.auto, digest: automation.digest };
 }
 
 function useEmbeddedToast() {
@@ -98,7 +84,7 @@ function useEmbeddedToast() {
   return [toast, show];
 }
 
-function createSettingsSection({ ctx, t, store, index, sync }) {
+function createSettingsSection({ ctx, t, store, index, sync, auto, digest }) {
   return function SettingsSection() {
     const state = useStore(store);
     useStore(index);
@@ -121,6 +107,8 @@ function createSettingsSection({ ctx, t, store, index, sync }) {
         counts: c,
         now: Date.now(),
         toast: show,
+        auto,
+        digest,
         onSync: () => {
           sync.run();
         },
@@ -130,7 +118,7 @@ function createSettingsSection({ ctx, t, store, index, sync }) {
   };
 }
 
-function registerSurfaces(ctx, { t, store, index, sync, Panel }) {
+function registerSurfaces(ctx, { t, store, index, sync, auto, digest, Panel }) {
   const openPanel = () => {
     try {
       ctx.ui.openCenterTab("board");
@@ -177,12 +165,12 @@ function registerSurfaces(ctx, { t, store, index, sync, Panel }) {
   ctx.ui.registerSettingsSection({
     key: "settings",
     label: () => t("Git 任务管理", "Git Tasks"),
-    component: createSettingsSection({ ctx, t, store, index, sync }),
+    component: createSettingsSection({ ctx, t, store, index, sync, auto, digest }),
   });
   return { openPanel, registerNav };
 }
 
-function bootstrap({ ctx, store, index, badges, registerNav, startScheduler, sync, isDisposed }) {
+function bootstrap({ ctx, store, index, badges, registerNav, startScheduler, sync, digest, isDisposed }) {
   return (async () => {
     await store.init();
     const cachedViewer = await ctx.storage.get("viewer").catch(() => null);
@@ -192,6 +180,7 @@ function bootstrap({ ctx, store, index, badges, registerNav, startScheduler, syn
     badges.refresh();
     registerNav();
     startScheduler();
+    digest.start();
     const result = await sync.run();
     if (result?.login) {
       ctx.storage.set("viewer", { v: 1, login: result.login }).catch(() => undefined);
@@ -215,7 +204,7 @@ function createLiveScheduler({ store, sync }) {
   return { scheduler, start, scheduled: () => scheduledInterval };
 }
 
-function installWatchers({ ctx, store, index, badges, registerNav, live }) {
+function installWatchers({ ctx, store, index, badges, auto, digest, registerNav, live }) {
   let lastNav = navCountOf(store, index);
   const syncNav = () => {
     const value = navCountOf(store, index);
@@ -224,7 +213,10 @@ function installWatchers({ ctx, store, index, badges, registerNav, live }) {
     registerNav();
   };
   const onVisibility = () => {
-    if (document.visibilityState === "visible") live.scheduler.wake();
+    if (document.visibilityState !== "visible") return;
+    live.scheduler.wake();
+    // 后台时定时器可能被系统节流：回到前台补查一次整点汇总。
+    digest.check();
   };
   const onStoreChange = () => {
     badges.refresh();
@@ -237,7 +229,11 @@ function installWatchers({ ctx, store, index, badges, registerNav, live }) {
     }
   };
   document.addEventListener("visibilitychange", onVisibility);
-  const offs = [store.subscribe(onStoreChange), index.subscribe(() => badges.refresh())];
+  const onIndexChange = () => {
+    auto.reconcile();
+    badges.refresh();
+  };
+  const offs = [store.subscribe(onStoreChange), index.subscribe(onIndexChange)];
   return {
     setLastNav: (value) => {
       lastNav = value;
@@ -249,10 +245,10 @@ function installWatchers({ ctx, store, index, badges, registerNav, live }) {
   };
 }
 
-function startLifecycle(ctx, { store, index, badges, sync, registerNav }) {
+function startLifecycle(ctx, { store, index, badges, sync, auto, digest, registerNav }) {
   let disposed = false;
   const live = createLiveScheduler({ store, sync });
-  const watchers = installWatchers({ ctx, store, index, badges, registerNav, live });
+  const watchers = installWatchers({ ctx, store, index, badges, auto, digest, registerNav, live });
   bootstrap({
     ctx,
     store,
@@ -263,11 +259,14 @@ function startLifecycle(ctx, { store, index, badges, sync, registerNav }) {
     },
     startScheduler: live.start,
     sync,
+    digest,
     isDisposed: () => disposed,
   });
   return () => {
     disposed = true;
     live.scheduler.stop();
+    auto.dispose();
+    digest.dispose();
     badges.dispose();
     watchers.off();
     store.flush();
@@ -292,7 +291,16 @@ export default function activate(ctx) {
   bindReact(ctx.react);
   const t = createT(ctx.host?.locale);
   const runtime = createRuntime(ctx, t);
-  const Panel = createPanel({ ctx, t, store: runtime.store, index: runtime.index, exec: runtime.exec, sync: runtime.sync });
+  const Panel = createPanel({
+    ctx,
+    t,
+    store: runtime.store,
+    index: runtime.index,
+    exec: runtime.exec,
+    sync: runtime.sync,
+    auto: runtime.auto,
+    digest: runtime.digest,
+  });
   const surfaces = registerSurfaces(ctx, { t, ...runtime, Panel });
   return startLifecycle(ctx, { ...runtime, registerNav: surfaces.registerNav });
 }

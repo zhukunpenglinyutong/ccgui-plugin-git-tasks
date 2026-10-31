@@ -418,3 +418,9 @@
 .ght-roadmap-title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-weight: 600; font-size: 12.5px; }
 .ght-roadmap-desc { margin-top: 2px; color: var(--ght-fg-3); font-size: 12px; line-height: 1.6; }
 .ght-roadmap-note { padding: 10px 14px; color: var(--ght-fg-3); font-size: 11.5px; border-top: 1px solid var(--ght-line); background: var(--ght-bg-sunken); }
+
+/* ---------- 自动化 ---------- */
+.ght-wt-auto { margin-left: 6px; padding: 0 6px; border-radius: 6px; background: var(--ght-accent-bg); color: var(--ght-accent); font-size: 11px; line-height: 18px; }
+.ght-banner-info { border-color: var(--ght-line-2); background: var(--ght-accent-bg); color: var(--ght-fg-2); }
+.ght-secret-in { width: 280px; text-align: left; }
+.ght-secret-v { font-size: 12px; color: var(--ght-fg-2); }

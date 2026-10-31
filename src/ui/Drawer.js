@@ -150,10 +150,16 @@ function NextCard({ t, pr, d, def, ns, now, onGh, onRefresh }) {
   );
 }
 
-function useRemoveWorktree({ ctx, store, index, pr, wt, toast, t }) {
+function useRemoveWorktree({ ctx, store, index, pr, wt, toast, t, checkDirty }) {
   const [confirming, setConfirming] = React.useState(false);
   const remove = async () => {
     if (!wt) return;
+    // 自动建的 worktree 与「清理」同一承诺：有未提交改动就不删（宿主删除带 --force）。
+    if (wt.auto && checkDirty && (await checkDirty(wt.path))) {
+      setConfirming(false);
+      toast(t("这个 worktree 有未提交改动，已取消删除", "This worktree has uncommitted changes; not removed"));
+      return;
+    }
     const repo = index.getSnapshot().repos.find((r) => r.slug === wt.repo);
     if (!repo) {
       toast(t("找不到这个 worktree 所属的仓库路径", "Can't resolve the repository path for this worktree"));
@@ -183,8 +189,26 @@ function useRemoveWorktree({ ctx, store, index, pr, wt, toast, t }) {
   return { confirming, setConfirming, remove };
 }
 
-function WorktreeActions({ t, ctx, store, index, pr, wt, bindings, terminal, toast, onBind, onWorktree }) {
-  const { confirming, setConfirming, remove } = useRemoveWorktree({ ctx, store, index, pr, wt, toast, t });
+function AdoptButton({ t, pr, wt, terminal, toast, onAdopt }) {
+  if (!wt?.auto || terminal || !onAdopt) return null;
+  return h(
+    "button",
+    {
+      key: "adopt",
+      type: "button",
+      className: "ght-btn ght-btn-pri",
+      title: t("这个 worktree 是插件自动建的；点了之后 PR 进入「审查中」", "Auto-created; marks the PR as Reviewing"),
+      onClick: () => {
+        onAdopt(pr.key);
+        toast(t(`#${pr.number} 已进入审查中`, `#${pr.number} is now Reviewing`));
+      },
+    },
+    t("开始审查", "Start review"),
+  );
+}
+
+function WorktreeActions({ t, ctx, store, index, pr, wt, bindings, terminal, toast, onBind, onWorktree, onAdopt, checkDirty }) {
+  const { confirming, setConfirming, remove } = useRemoveWorktree({ ctx, store, index, pr, wt, toast, t, checkDirty });
   if (!wt) {
     return [
       h("span", { key: "s", className: "ght-src" }, t("还没有对应的 worktree", "No worktree linked")),
@@ -210,6 +234,7 @@ function WorktreeActions({ t, ctx, store, index, pr, wt, bindings, terminal, toa
     h("b", { key: "n", className: "ght-mono" }, wt.name),
     h("span", { key: "s", className: "ght-src" }, linkSource(wt, pr, bindings)),
     h("span", { key: "sp", className: "ght-sp" }),
+    h(AdoptButton, { key: "adopt", t, pr, wt, terminal, toast, onAdopt }),
     ...(terminal
       ? removeButtons
       : [h("button", { key: "copy", type: "button", className: "ght-btn", onClick: () => onWorktree(wt) }, t("复制路径", "Copy path"))]),
@@ -234,7 +259,7 @@ function WorktreeActions({ t, ctx, store, index, pr, wt, bindings, terminal, toa
   ];
 }
 
-function WorktreeSection({ t, ctx, store, index, pr, wt, bindings, terminal, toast, onBind, onWorktree }) {
+function WorktreeSection({ t, ctx, store, index, pr, wt, bindings, terminal, toast, onBind, onWorktree, onAdopt, checkDirty }) {
   return h(
     "div",
     null,
@@ -247,7 +272,7 @@ function WorktreeSection({ t, ctx, store, index, pr, wt, bindings, terminal, toa
     h(
       "div",
       { className: "ght-wt-box" },
-      h(WorktreeActions, { t, ctx, store, index, pr, wt, bindings, terminal, toast, onBind, onWorktree }),
+      h(WorktreeActions, { t, ctx, store, index, pr, wt, bindings, terminal, toast, onBind, onWorktree, onAdopt, checkDirty }),
     ),
   );
 }
@@ -334,10 +359,10 @@ function DrawerHeader({ t, pr, d, def, ignored, onGh, onClose, onRefresh }) {
   );
 }
 
-export function Drawer({ t, ctx, store, pr, rules, defs, now, wts, prs, bindings, index, toast, onClose, onGh, onRefresh, onBind, onWorktree }) {
+export function Drawer({ t, ctx, store, pr, rules, defs, now, wts, prs, bindings, index, toast, onClose, onGh, onRefresh, onBind, onWorktree, onAdopt, checkDirty }) {
   const d = derive(pr, rules);
   const wt0 = wtFor(pr, { wts, prs, bindings, rules });
-  const dView = reviewingState(d, !!wt0, store.getSnapshot().local.reviewing[pr.key]);
+  const dView = reviewingState(d, !!wt0 && !wt0.auto, store.getSnapshot().local.reviewing[pr.key]);
   const def = defs[dView.key];
   const ns = nextStep(pr, dView, rules, now, t);
   const wt = wt0;
@@ -352,7 +377,7 @@ export function Drawer({ t, ctx, store, pr, rules, defs, now, wts, prs, bindings
         "div",
         { className: "ght-dr-body" },
         h(NextCard, { t, pr, d: dView, def, ns, now, onGh, onRefresh }),
-        h(WorktreeSection, { t, ctx, store, index, pr, wt, bindings, terminal, toast, onBind, onWorktree }),
+        h(WorktreeSection, { t, ctx, store, index, pr, wt, bindings, terminal, toast, onBind, onWorktree, onAdopt, checkDirty }),
         h(
           "div",
           null,

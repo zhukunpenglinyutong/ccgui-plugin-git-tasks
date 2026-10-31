@@ -70,12 +70,17 @@ function CreatePreview({ t, pr, branch, repo }) {
   );
 }
 
-function useCreateWorktree({ t, ctx, store, index, pr, repo, branch, toast, onClose }) {
+function useCreateWorktree({ t, ctx, store, index, auto, pr, repo, branch, toast, onClose }) {
   const [creating, setCreating] = React.useState(false);
   const [error, setError] = React.useState(null);
   const create = async () => {
     if (!repo) {
       setError(t("找不到这个仓库对应的工作区，无法创建", "No workspace found for this repository"));
+      return;
+    }
+    // 与自动建共用“创建中”登记：同一个 PR 不会被手动和自动各建一个。
+    if (auto && !auto.claim(pr.key)) {
+      setError(t("插件正在为这个 PR 自动创建 worktree，请稍候", "This PR's worktree is being created automatically"));
       return;
     }
     setCreating(true);
@@ -89,8 +94,8 @@ function useCreateWorktree({ t, ctx, store, index, pr, repo, branch, toast, onCl
         prTitle: pr.title,
         prUrl: pr.url,
       });
-      const snapshot = await index.refresh();
-      const created = snapshot.worktrees.find((w) => w.path === result.worktreePath);
+      // 宿主刷新侧栏晚于创建完成：等新 worktree 出现再绑定，否则关掉「按 PR 号对应」时会对不上。
+      const created = await index.waitForWorktree(result.worktreePath);
       if (created) {
         store.bind(pr.key, created.workspaceId);
         store.markReviewing(pr.key, Date.now());
@@ -101,6 +106,7 @@ function useCreateWorktree({ t, ctx, store, index, pr, repo, branch, toast, onCl
       const message = err?.message || String(err);
       setError(t(`创建失败：${message}`, `Create failed: ${message}`));
     } finally {
+      if (auto) auto.release(pr.key);
       setCreating(false);
     }
   };
@@ -175,9 +181,11 @@ function useBindState({ pr, index, wts, prs, bindings, rules }) {
   return { cands, firstFree, mode, setMode, pick, setPick, branch, repo };
 }
 
-function confirmBind({ store, cands, pick, pr, t, toast, onClose }) {
+function confirmBind({ store, auto, cands, pick, pr, t, toast, onClose }) {
   if (!pick) return;
   const candidate = cands.find((c) => c.wt.workspaceId === pick);
+  // 你主动绑定了一个自动建的 worktree：它就是你的了。
+  if (candidate?.wt.auto && auto) auto.adoptWorktree(pick);
   store.bind(pr.key, pick);
   store.markReviewing(pr.key, Date.now());
   toast(
@@ -188,12 +196,12 @@ function confirmBind({ store, cands, pick, pr, t, toast, onClose }) {
   onClose();
 }
 
-export function BindModal({ t, ctx, store, index, pr, wts, prs, bindings, rules, toast, onClose }) {
+export function BindModal({ t, ctx, store, index, auto, pr, wts, prs, bindings, rules, toast, onClose }) {
   const { cands, firstFree, mode, setMode, pick, setPick, branch, repo } = useBindState({ pr, index, wts, prs, bindings, rules });
-  const creation = useCreateWorktree({ t, ctx, store, index, pr, repo, branch, toast, onClose });
+  const creation = useCreateWorktree({ t, ctx, store, index, auto, pr, repo, branch, toast, onClose });
   const confirm = () => {
     if (mode !== "bind") creation.create();
-    else confirmBind({ store, cands, pick, pr, t, toast, onClose });
+    else confirmBind({ store, auto, cands, pick, pr, t, toast, onClose });
   };
   return [
     h("div", { key: "scrim", className: "ght-mscrim", onClick: onClose }),
