@@ -1,14 +1,14 @@
 {
   "id": "github-tasks",
   "name": "CCGUI · Git 任务管理",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "sdkVersion": ">=0.3.22",
   "minAppVersion": "1.1.8",
   "tier": "js",
   "author": "zhukunpenglinyutong",
   "license": "MIT",
   "repo": "zhukunpenglinyutong/ccgui-plugin-git-tasks",
-  "description": "轻量 PR 流转看板：多仓库每日新增、我审没审、作者修没修、修完我看没看；看板拖拽只记本地标记；侧栏 worktree 显示 PR 状态。可选自动化：为待审查 PR 自动建 worktree、飞书每小时汇总（默认关闭）。只读 gh CLI，不调用 AI、不写 GitHub。",
+  "description": "轻量 PR 流转看板：多仓库每日新增、我审没审、作者修没修、修完我看没看；侧栏 worktree 显示 PR 状态。可选：自动建 worktree、飞书每小时汇总（默认关）。只读 gh，不写 GitHub。",
   "permissions": [
     "ui:center-tab",
     "ui:sidebar-entry",
