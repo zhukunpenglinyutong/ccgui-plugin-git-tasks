@@ -4,10 +4,23 @@
 
 import { mapWorktrees, resolveWorkspaceRepos } from "./repos.js";
 
-/** 合并仓库设置：保留既有顺序与开关（颜色稳定），新仓库追加。 */
-export function mergeRepoList(existing, discovered) {
+/** 当前 gh 账号 + 设置里的其他账号（小写）；只有这些 owner 名下的仓库才算“我的”。 */
+export function ownersOf(state) {
+  return new Set(
+    [state.runtime.ghLogin, ...(state.cfg.extraAccounts || [])]
+      .filter(Boolean)
+      .map((v) => String(v).toLowerCase()),
+  );
+}
+
+const isOwned = (owners, slug) => owners.has(String(slug).split("/")[0].toLowerCase());
+
+/** 合并仓库设置：保留既有顺序与开关（颜色稳定），新仓库追加；不属于 owners 的旧条目移除。 */
+export function mergeRepoList(existing, discovered, owners) {
   const found = new Set(discovered.map((d) => d.slug));
-  const kept = (existing || []).map((item) => ({ ...item, available: found.has(item.slug) }));
+  const kept = (existing || [])
+    .filter((item) => !owners || isOwned(owners, item.slug))
+    .map((item) => ({ ...item, available: found.has(item.slug) }));
   const known = new Set(kept.map((item) => item.slug));
   const added = discovered
     .filter((d) => !known.has(d.slug))
@@ -36,15 +49,17 @@ export function createWorkspaceIndex({ ctx, exec, store, onUpdate, now = Date.no
     set({ ...snapshot, loading: true, error: null });
     try {
       const rows = await ctx.workspaces.list();
-      const repos = await resolveWorkspaceRepos(rows, {
-        runGit: (args) => exec.runGit(args),
-      });
+      const owners = ownersOf(store.getSnapshot());
+      // 别人的仓库（fork 来源、只是 clone 下来看的）不跟踪、不建 worktree；账号未知时一个都不认。
+      const repos = (
+        await resolveWorkspaceRepos(rows, { runGit: (args) => exec.runGit(args) })
+      ).filter((r) => isOwned(owners, r.slug));
       const byWorkspace = new Map(repos.map((r) => [r.workspaceId, r]));
       const worktrees = mapWorktrees(rows, byWorkspace);
       set({ repos, worktrees, loading: false, error: null });
-      // 宿主侧栏尚未加载完时可能短暂返回空数组：不能据此清空仓库设置与绑定。
-      if (rows.length > 0) {
-        store.setRepos(mergeRepoList(store.getSnapshot().cfg.repos, repos));
+      // 宿主侧栏尚未加载完时可能短暂返回空数组、账号尚未拿到时 repos 为空：都不能据此清空仓库设置与绑定。
+      if (rows.length > 0 && owners.size > 0) {
+        store.setRepos(mergeRepoList(store.getSnapshot().cfg.repos, repos, owners));
         store.pruneBindings(new Set(worktrees.map((w) => w.workspaceId)));
       }
       return snapshot;

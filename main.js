@@ -3592,9 +3592,15 @@ function mapWorktrees(workspaces, repoByWorkspaceId) {
 }
 
 // src/workspaces.js
-function mergeRepoList(existing, discovered) {
+function ownersOf(state) {
+  return new Set(
+    [state.runtime.ghLogin, ...state.cfg.extraAccounts || []].filter(Boolean).map((v) => String(v).toLowerCase())
+  );
+}
+var isOwned = (owners, slug) => owners.has(String(slug).split("/")[0].toLowerCase());
+function mergeRepoList(existing, discovered, owners) {
   const found = new Set(discovered.map((d) => d.slug));
-  const kept = (existing || []).map((item) => ({ ...item, available: found.has(item.slug) }));
+  const kept = (existing || []).filter((item) => !owners || isOwned(owners, item.slug)).map((item) => ({ ...item, available: found.has(item.slug) }));
   const known = new Set(kept.map((item) => item.slug));
   const added = discovered.filter((d) => !known.has(d.slug)).map((d) => ({ slug: d.slug, enabled: true, available: true }));
   return [...kept, ...added];
@@ -3617,14 +3623,13 @@ function createWorkspaceIndex({ ctx, exec, store, onUpdate, now = Date.now, slee
     set({ ...snapshot, loading: true, error: null });
     try {
       const rows = await ctx.workspaces.list();
-      const repos = await resolveWorkspaceRepos(rows, {
-        runGit: (args) => exec.runGit(args)
-      });
+      const owners = ownersOf(store.getSnapshot());
+      const repos = (await resolveWorkspaceRepos(rows, { runGit: (args) => exec.runGit(args) })).filter((r) => isOwned(owners, r.slug));
       const byWorkspace = new Map(repos.map((r) => [r.workspaceId, r]));
       const worktrees = mapWorktrees(rows, byWorkspace);
       set({ repos, worktrees, loading: false, error: null });
-      if (rows.length > 0) {
-        store.setRepos(mergeRepoList(store.getSnapshot().cfg.repos, repos));
+      if (rows.length > 0 && owners.size > 0) {
+        store.setRepos(mergeRepoList(store.getSnapshot().cfg.repos, repos, owners));
         store.pruneBindings(new Set(worktrees.map((w) => w.workspaceId)));
       }
       return snapshot;
@@ -6974,11 +6979,19 @@ function registerSurfaces(ctx, { t, store, index, sync, auto, digest, Panel }) {
   });
   return { openPanel, registerNav };
 }
-function bootstrap({ ctx, store, index, badges, registerNav, startScheduler, sync, digest, isDisposed }) {
+async function loadViewer(ctx, store, exec) {
+  const cached = await ctx.storage.get("viewer").catch(() => null);
+  if (cached?.login) {
+    store.setRuntime({ ghLogin: cached.login });
+    return;
+  }
+  const login = await fetchViewerLogin(exec).catch(() => null);
+  if (login) store.setRuntime({ ghLogin: login });
+}
+function bootstrap({ ctx, store, exec, index, badges, registerNav, startScheduler, sync, digest, isDisposed }) {
   return (async () => {
     await store.init();
-    const cachedViewer = await ctx.storage.get("viewer").catch(() => null);
-    if (cachedViewer?.login) store.setRuntime({ ghLogin: cachedViewer.login });
+    await loadViewer(ctx, store, exec);
     await index.refresh();
     if (isDisposed()) return;
     badges.refresh();
@@ -7007,6 +7020,7 @@ function createLiveScheduler({ store, sync }) {
 }
 function installWatchers({ ctx, store, index, badges, auto, digest, registerNav, live }) {
   let lastNav = navCountOf(store, index);
+  let lastOwners = [...ownersOf(store.getSnapshot())].join("|");
   const syncNav = () => {
     const value = navCountOf(store, index);
     if (value === lastNav) return;
@@ -7023,6 +7037,11 @@ function installWatchers({ ctx, store, index, badges, auto, digest, registerNav,
     syncNav();
     if (store.getSnapshot().cfg.rules.interval !== live.scheduled()) live.start();
     const state = store.getSnapshot();
+    const owners = [...ownersOf(state)].join("|");
+    if (owners !== lastOwners) {
+      lastOwners = owners;
+      index.refresh().catch(() => void 0);
+    }
     if (state.ready) {
       const nextDefs = localeDefsFor(state.cfg.defs, ctx.host?.locale);
       if (nextDefs) store.setDefs(nextDefs);
@@ -7044,13 +7063,14 @@ function installWatchers({ ctx, store, index, badges, auto, digest, registerNav,
     }
   };
 }
-function startLifecycle(ctx, { store, index, badges, sync, auto, digest, registerNav }) {
+function startLifecycle(ctx, { store, exec, index, badges, sync, auto, digest, registerNav }) {
   let disposed = false;
   const live = createLiveScheduler({ store, sync });
   const watchers = installWatchers({ ctx, store, index, badges, auto, digest, registerNav, live });
   bootstrap({
     ctx,
     store,
+    exec,
     index,
     badges,
     registerNav: () => {

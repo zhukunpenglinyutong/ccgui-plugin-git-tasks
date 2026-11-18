@@ -58,6 +58,7 @@ function delayedHost() {
 test("waitForWorktree：侧栏稍后才出现新 worktree，轮询到它为止", async () => {
   const store = createStore({ load: async () => null, save: async () => {}, debounceMs: 0 });
   await store.init();
+  store.setRuntime({ ghLogin: "acme" });
   const host = delayedHost();
   const index = createWorkspaceIndex({
     ctx: host.ctx,
@@ -85,4 +86,42 @@ test("waitForWorktree：超时返回 null，不无限等待", async () => {
   });
   assert.equal(await index.waitForWorktree("/never", { timeoutMs: 2000 }), null);
   assert.ok(clock >= 2000);
+});
+
+function ownerHost() {
+  const remotes = { "/mine": "git@github.com:Acme/mine.git", "/theirs": "https://github.com/someone/theirs.git" };
+  return {
+    ctx: {
+      workspaces: {
+        list: async () => [
+          { id: "w1", path: "/mine", name: "mine" },
+          { id: "w2", path: "/theirs", name: "theirs" },
+          { id: "wt2", path: "/theirs-wt", name: "t", kind: "worktree", parentId: "w2", worktree: {} },
+        ],
+      },
+    },
+    exec: { runGit: async (args) => ({ code: 0, stdout: `${remotes[args[1]]}\n`, stderr: "" }) },
+  };
+}
+
+test("只跟踪自己账号名下的仓库：别人的仓库不出现，旧设置里的也移除", async () => {
+  const store = createStore({ load: async () => null, save: async () => {}, debounceMs: 0 });
+  await store.init();
+  store.setRepos([{ slug: "someone/theirs", enabled: true, available: true }]);
+  store.setRuntime({ ghLogin: "acme" });
+  const index = createWorkspaceIndex({ ...ownerHost(), store });
+  const snap = await index.refresh();
+  assert.deepEqual(snap.repos.map((r) => r.slug), ["Acme/mine"]);
+  assert.deepEqual(snap.worktrees, []);
+  assert.deepEqual(store.getSnapshot().cfg.repos.map((r) => r.slug), ["Acme/mine"]);
+});
+
+test("账号未知：不认任何仓库，也不动已有设置", async () => {
+  const store = createStore({ load: async () => null, save: async () => {}, debounceMs: 0 });
+  await store.init();
+  store.setRepos([{ slug: "acme/mine", enabled: false, available: true }]);
+  const index = createWorkspaceIndex({ ...ownerHost(), store });
+  const snap = await index.refresh();
+  assert.deepEqual(snap.repos, []);
+  assert.deepEqual(store.getSnapshot().cfg.repos, [{ slug: "acme/mine", enabled: false, available: true }]);
 });

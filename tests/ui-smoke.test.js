@@ -117,6 +117,7 @@ async function mount() {
   const ctx = fakeCtx(exec);
   const store = createStore({ load: async () => null, save: async () => {}, debounceMs: 0 });
   await store.init();
+  store.setRuntime({ ghLogin: "zhukunpenglinyutong" });
   const index = createWorkspaceIndex({ ctx, exec, store });
   await index.refresh();
   const snap = await fetchRepo("zhukunpenglinyutong/desktop-cc-gui", {
@@ -362,6 +363,7 @@ test("设置分区组件可单独渲染（客户端设置 › 插件）", async 
   const ctx = fakeCtx(exec);
   const store = createStore({ load: async () => null, save: async () => {}, debounceMs: 0 });
   await store.init();
+  store.setRuntime({ ghLogin: "zhukunpenglinyutong" });
   const index = createWorkspaceIndex({ ctx, exec, store });
   await index.refresh();
   const container = document.createElement("div");

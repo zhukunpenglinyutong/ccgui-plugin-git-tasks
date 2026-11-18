@@ -7,8 +7,8 @@ import { createBadges } from "./badges.js";
 import { createExec } from "./gh/exec.js";
 import { createT, isEnglish, DEFAULT_DEFS_EN } from "./i18n.js";
 import { createStore } from "./store.js";
-import { createSync, createScheduler } from "./sync.js";
-import { createWorkspaceIndex } from "./workspaces.js";
+import { createSync, createScheduler, fetchViewerLogin } from "./sync.js";
+import { createWorkspaceIndex, ownersOf } from "./workspaces.js";
 import { counts } from "./domain/stats.js";
 import { trackedRows } from "./rows.js";
 import { bindReact, React } from "./ui/react.js";
@@ -170,11 +170,21 @@ function registerSurfaces(ctx, { t, store, index, sync, auto, digest, Panel }) {
   return { openPanel, registerNav };
 }
 
-function bootstrap({ ctx, store, index, badges, registerNav, startScheduler, sync, digest, isDisposed }) {
+async function loadViewer(ctx, store, exec) {
+  const cached = await ctx.storage.get("viewer").catch(() => null);
+  if (cached?.login) {
+    store.setRuntime({ ghLogin: cached.login });
+    return;
+  }
+  // 仓库按 owner 过滤，首次启动要先拿到账号；失败交给随后的 sync 报错。
+  const login = await fetchViewerLogin(exec).catch(() => null);
+  if (login) store.setRuntime({ ghLogin: login });
+}
+
+function bootstrap({ ctx, store, exec, index, badges, registerNav, startScheduler, sync, digest, isDisposed }) {
   return (async () => {
     await store.init();
-    const cachedViewer = await ctx.storage.get("viewer").catch(() => null);
-    if (cachedViewer?.login) store.setRuntime({ ghLogin: cachedViewer.login });
+    await loadViewer(ctx, store, exec);
     await index.refresh();
     if (isDisposed()) return;
     badges.refresh();
@@ -206,6 +216,7 @@ function createLiveScheduler({ store, sync }) {
 
 function installWatchers({ ctx, store, index, badges, auto, digest, registerNav, live }) {
   let lastNav = navCountOf(store, index);
+  let lastOwners = [...ownersOf(store.getSnapshot())].join("|");
   const syncNav = () => {
     const value = navCountOf(store, index);
     if (value === lastNav) return;
@@ -223,6 +234,12 @@ function installWatchers({ ctx, store, index, badges, auto, digest, registerNav,
     syncNav();
     if (store.getSnapshot().cfg.rules.interval !== live.scheduled()) live.start();
     const state = store.getSnapshot();
+    const owners = [...ownersOf(state)].join("|");
+    if (owners !== lastOwners) {
+      // 账号变了（首次拿到 / 切换 / 改了其他账号）：重新筛一遍“我的仓库”。
+      lastOwners = owners;
+      index.refresh().catch(() => undefined);
+    }
     if (state.ready) {
       const nextDefs = localeDefsFor(state.cfg.defs, ctx.host?.locale);
       if (nextDefs) store.setDefs(nextDefs);
@@ -245,13 +262,14 @@ function installWatchers({ ctx, store, index, badges, auto, digest, registerNav,
   };
 }
 
-function startLifecycle(ctx, { store, index, badges, sync, auto, digest, registerNav }) {
+function startLifecycle(ctx, { store, exec, index, badges, sync, auto, digest, registerNav }) {
   let disposed = false;
   const live = createLiveScheduler({ store, sync });
   const watchers = installWatchers({ ctx, store, index, badges, auto, digest, registerNav, live });
   bootstrap({
     ctx,
     store,
+    exec,
     index,
     badges,
     registerNav: () => {
